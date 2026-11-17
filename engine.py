@@ -12,8 +12,8 @@ from google.genai.errors import ClientError
 from schemas import StockSignal, CommitteeOutput, FinalDecision
 
 DB_PATH = "nse_demo_trades.db"
-PRIMARY_MODEL = "gemini-3.5-flash-lite"
-FALLBACK_MODEL = "gemini-3.8-flash"
+PRIMARY_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 NSE_WATCHLIST = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
@@ -73,12 +73,12 @@ def fetch_nse_metrics() -> list[dict]:
         try:
             ticker = yf.Ticker(sym)
             hist = ticker.history(period="6mo", interval="1d")
-            if len(hist) < 50:
+            if len(hist) < 30:
                 continue
             close, volume = hist["Close"], hist["Volume"]
             ltp = float(close.iloc[-1])
-            sma_50 = float(close.rolling(50).mean().iloc[-1])
-            sma_200 = float(close.rolling(200).mean().iloc[-1]) if len(hist) >= 200 else sma_50
+            sma_50 = float(close.rolling(min(50, len(hist))).mean().iloc[-1])
+            sma_200 = float(close.rolling(min(200, len(hist))).mean().iloc[-1])
 
             delta = close.diff()
             gain = delta.clip(lower=0).rolling(14).mean()
@@ -90,7 +90,11 @@ def fetch_nse_metrics() -> list[dict]:
             atr = float((hist["High"] - hist["Low"]).rolling(14).mean().iloc[-1])
             avg_vol = float(volume.rolling(20).mean().iloc[-1])
             rvol = float(volume.iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
-            beta = float(ticker.info.get("beta") or 1.0)
+
+            try:
+                beta = float(ticker.info.get("beta") or 1.0)
+            except Exception:
+                beta = 1.0
 
             snapshots.append({
                 "symbol": sym,
@@ -137,13 +141,13 @@ async def generate_with_fallback(client, prompt: str, schema, temperature: float
 
 async def run_screener(client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict]) -> list[StockSignal]:
     if not data_slice:
-        log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE tickers matched filter criteria.", [])
+        log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched this cycle.", [])
         return []
 
     prompt = (
         f"You are {agent_id} for NSE India. {rules} "
-        f"Pick up to 2 best stocks from this real-time NSE data and set realistic INR entry_price, stop_loss, and target_price: "
-        f"{json.dumps(data_slice)}"
+        f"From the real-time NSE data below, pick the 2 best stocks matching your risk tier and calculate realistic INR "
+        f"entry_price, stop_loss, and target_price. Market Data: {json.dumps(data_slice)}"
     )
     raw = await generate_with_fallback(client, prompt, list[StockSignal], temperature=0.2)
     signals = [StockSignal(**item) for item in raw]
@@ -161,7 +165,7 @@ async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> Commi
     prompt = (
         "You are AG4, Chief Analyst for NSE India. Audit all candidates from AG1 (Low Risk), AG2 (Mid Risk), "
         "and AG3 (High Risk) alongside their latest news headlines. Mark each as BUY or SKIP. "
-        "Reject stocks with negative news or weak risk/reward (< 1:1.8). "
+        "Approve the strongest 1-3 setups with clean news and risk/reward >= 1:1.6. "
         f"Inputs: {json.dumps(enriched)}"
     )
     raw = await generate_with_fallback(client, prompt, CommitteeOutput, temperature=0.1)
@@ -205,7 +209,7 @@ def ag5_broker_step(cycle_id: str, decisions: list[FinalDecision], live_prices: 
 
     # 2. Execute new virtual BUY orders
     for d in decisions:
-        if d.action != "BUY" or d.conviction < 70:
+        if d.action != "BUY" or d.conviction < 65:
             continue
         if cur.execute("SELECT id FROM trades WHERE symbol=? AND status='OPEN'", (d.symbol,)).fetchone():
             continue
@@ -249,20 +253,27 @@ async def run_full_cycle(api_key: str):
     market_data = fetch_nse_metrics()
     live_prices = {m["symbol"]: m["ltp"] for m in market_data}
 
-    ag1_slice = [d for d in market_data if d["beta"] <= 1.0 and d["ltp"] >= d["sma_200"]]
-    ag2_slice = [d for d in market_data if 0.85 < d["beta"] <= 1.5 and d["rvol"] >= 1.0]
-    ag3_slice = [d for d in market_data if d["beta"] > 1.25 or abs(d["day_change_pct"]) >= 1.5]
+    # Pass full market slice so each agent ranks the best fit for its risk tier
+    ag1_slice = [d for d in market_data if d["beta"] <= 1.05] or market_data
+    ag2_slice = [d for d in market_data if 0.85 <= d["beta"] <= 1.55] or market_data
+    ag3_slice = [d for d in market_data if d["beta"] >= 1.15 or abs(d["day_change_pct"]) >= 1.2] or market_data
 
     ag1 = await run_screener(
-        client, cycle_id, "AG1_LOW_RISK", "Low Beta (<=1.0), above 200-SMA, steady compounding.", ag1_slice
+        client, cycle_id, "AG1_LOW_RISK",
+        "Focus on LOW-RISK large-cap stability (lowest beta, price near or above 200-SMA, tight 1.5x ATR stop).",
+        ag1_slice,
     )
     await asyncio.sleep(1.5)
     ag2 = await run_screener(
-        client, cycle_id, "AG2_MID_RISK", "Strong RVOL (>=1.0x), above 50-SMA, momentum swing.", ag2_slice
+        client, cycle_id, "AG2_MID_RISK",
+        "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
+        ag2_slice,
     )
     await asyncio.sleep(1.5)
     ag3 = await run_screener(
-        client, cycle_id, "AG3_HIGH_RISK", "High beta or sharp daily mover (>=1.5%), tight 1x ATR stop.", ag3_slice
+        client, cycle_id, "AG3_HIGH_RISK",
+        "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move, tight 1x ATR stop).",
+        ag3_slice,
     )
 
     candidates = ag1 + ag2 + ag3
