@@ -8,12 +8,11 @@ import yfinance as yf
 import feedparser
 from google import genai
 from google.genai import types
-from google.genai.errors import ClientError
+from google.genai.errors import APIError
 from schemas import StockSignal, CommitteeOutput, FinalDecision
 
 DB_PATH = "nse_demo_trades.db"
-PRIMARY_MODEL = "gemini-3.8-flash"
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
+CANDIDATE_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
 NSE_WATCHLIST = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
@@ -119,24 +118,55 @@ def fetch_nse_news(symbol: str) -> list[str]:
     return [entry.title for entry in feed.entries[:4]]
 
 
-async def generate_with_fallback(client, prompt: str, schema, temperature: float = 0.2):
-    for model_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        try:
-            resp = await client.aio.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                    temperature=temperature,
-                ),
+async def generate_with_retry(client, prompt: str, schema, temperature: float = 0.2):
+    last_error = None
+    for model_name in CANDIDATE_MODELS:
+        for attempt in range(3):
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=schema,
+                        temperature=temperature,
+                    ),
+                )
+                return json.loads(resp.text)
+            except APIError as e:
+                last_error = e
+                # Retry on temporary 503 overload or 429 rate-limit spikes
+                if e.code in (429, 500, 503):
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
+                # Move to next model on 404 Not Found
+                if e.code == 404:
+                    break
+                raise e
+    raise last_error
+
+
+def quant_fallback_screener(agent_id: str, data_slice: list[dict]) -> list[StockSignal]:
+    """Deterministic backup if Gemini API is temporarily overloaded (503)."""
+    sorted_data = sorted(data_slice, key=lambda x: x["rvol"], reverse=True)[:2]
+    signals = []
+    for d in sorted_data:
+        atr = max(d["atr_14"], d["ltp"] * 0.01)
+        signals.append(
+            StockSignal(
+                agent_id=agent_id,
+                symbol=d["symbol"],
+                ltp=d["ltp"],
+                entry_price=d["ltp"],
+                stop_loss=round(d["ltp"] - 1.5 * atr, 2),
+                target_price=round(d["ltp"] + 3.0 * atr, 2),
+                rsi_14=d["rsi_14"],
+                rvol=d["rvol"],
+                beta=d["beta"],
+                setup_reason=f"Quant backup (503 server spike): RVOL {d['rvol']}x, RSI {d['rsi_14']}, ATR-based 1:2 R:R.",
             )
-            return json.loads(resp.text)
-        except ClientError as e:
-            if e.code in (404, 429) and model_name == PRIMARY_MODEL:
-                await asyncio.sleep(2.0)
-                continue
-            raise e
+        )
+    return signals
 
 
 async def run_screener(client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict]) -> list[StockSignal]:
@@ -149,10 +179,20 @@ async def run_screener(client, cycle_id: str, agent_id: str, rules: str, data_sl
         f"From the real-time NSE data below, pick the 2 best stocks matching your risk tier and calculate realistic INR "
         f"entry_price, stop_loss, and target_price. Market Data: {json.dumps(data_slice)}"
     )
-    raw = await generate_with_fallback(client, prompt, list[StockSignal], temperature=0.2)
-    signals = [StockSignal(**item) for item in raw]
+    try:
+        raw = await generate_with_retry(client, prompt, list[StockSignal], temperature=0.2)
+        signals = [StockSignal(**item) for item in raw]
+        mode_tag = ""
+    except APIError as e:
+        if e.code in (503, 429):
+            signals = quant_fallback_screener(agent_id, data_slice)
+            mode_tag = " [Quant Backup during Gemini 503 spike]"
+        else:
+            raise e
+
     summary = (
-        f"Sent {len(signals)} stock(s) to AG4: " + ", ".join([f"{s.symbol} @ ₹{s.entry_price}" for s in signals])
+        f"Sent {len(signals)} stock(s) to AG4{mode_tag}: "
+        + ", ".join([f"{s.symbol} @ ₹{s.entry_price}" for s in signals])
         if signals
         else "No setups approved."
     )
@@ -168,8 +208,38 @@ async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> Commi
         "Approve the strongest 1-3 setups with clean news and risk/reward >= 1:1.6. "
         f"Inputs: {json.dumps(enriched)}"
     )
-    raw = await generate_with_fallback(client, prompt, CommitteeOutput, temperature=0.1)
-    decision = CommitteeOutput(**raw)
+    try:
+        raw = await generate_with_retry(client, prompt, CommitteeOutput, temperature=0.1)
+        decision = CommitteeOutput(**raw)
+    except APIError as e:
+        if e.code in (503, 429):
+            # Quantitative fallback filter when Gemini returns temporary 503 overload
+            tier_map = {"AG1_LOW_RISK": "LOW", "AG2_MID_RISK": "MID", "AG3_HIGH_RISK": "HIGH"}
+            fallback_trades = []
+            seen = set()
+            for c in candidates:
+                if c.symbol in seen:
+                    continue
+                seen.add(c.symbol)
+                rr = (c.target_price - c.entry_price) / max(c.entry_price - c.stop_loss, 0.01)
+                action = "BUY" if rr >= 1.6 and len(fallback_trades) < 2 else "SKIP"
+                fallback_trades.append(
+                    FinalDecision(
+                        symbol=c.symbol,
+                        risk_tier=tier_map[c.agent_id],
+                        action=action,
+                        conviction=75 if action == "BUY" else 50,
+                        entry_price=c.entry_price,
+                        stop_loss=c.stop_loss,
+                        target_price=c.target_price,
+                        news_status="CLEAR",
+                        reasoning=f"Quant backup audit (Gemini 503 spike): R:R = 1:{rr:.2f}, RSI = {c.rsi_14}.",
+                    )
+                )
+            decision = CommitteeOutput(selected_trades=fallback_trades)
+        else:
+            raise e
+
     buys = [d for d in decision.selected_trades if d.action == "BUY"]
     log_msg(
         cycle_id,
@@ -253,7 +323,6 @@ async def run_full_cycle(api_key: str):
     market_data = fetch_nse_metrics()
     live_prices = {m["symbol"]: m["ltp"] for m in market_data}
 
-    # Pass full market slice so each agent ranks the best fit for its risk tier
     ag1_slice = [d for d in market_data if d["beta"] <= 1.05] or market_data
     ag2_slice = [d for d in market_data if 0.85 <= d["beta"] <= 1.55] or market_data
     ag3_slice = [d for d in market_data if d["beta"] >= 1.15 or abs(d["day_change_pct"]) >= 1.2] or market_data
