@@ -1,493 +1,344 @@
-import streamlit as st
-import sqlite3
-import asyncio
 import os
 import json
+import asyncio
+import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import pandas as pd
+from urllib.parse import quote
 import yfinance as yf
-from engine import init_db, run_full_cycle, DB_PATH
+import feedparser
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from schemas import StockSignal, CommitteeOutput, FinalDecision
 
 IST = ZoneInfo("Asia/Kolkata")
+DB_PATH = "nse_demo_trades.db"
+CANDIDATE_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
-st.set_page_config(
-    page_title="5-Agent Intelligent Stock Trading Platform",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-init_db()
+NSE_WATCHLIST = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+    "ITC.NS", "LT.NS", "SBIN.NS", "BHARTIARTL.NS", "SUNPHARMA.NS",
+    "TATAMOTORS.NS", "TATASTEEL.NS", "ADANIENT.NS", "BAJFINANCE.NS",
+    "TRENT.NS", "HAL.NS", "BEL.NS", "ZOMATO.NS", "DIXON.NS", "KPITTECH.NS"
+]
 
-# --- CUSTOM CYBER-TERMINAL CSS ---
-st.markdown("""
-<style>
-    .stApp {
-        background: radial-gradient(circle at top right, #0f1c36 0%, #070d19 60%, #050912 100%);
-        color: #e2e8f0;
-    }
-    section[data-testid="stSidebar"] {
-        background-color: #081020;
-        border-right: 1px solid #1e293b;
-    }
-    .top-bar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background: linear-gradient(90deg, #0d172a 0%, #111f38 100%);
-        border: 1px solid #1e3a5f;
-        border-radius: 12px;
-        padding: 12px 20px;
-        margin-bottom: 16px;
-    }
-    .platform-title {
-        font-size: 22px;
-        font-weight: 700;
-        color: #f8fafc;
-        margin: 0;
-    }
-    .live-pill {
-        background: rgba(16, 185, 129, 0.15);
-        border: 1px solid #10b981;
-        color: #34d399;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-size: 13px;
-        font-weight: 600;
-    }
-    .wf-card {
-        border-radius: 12px;
-        padding: 14px 10px;
-        text-align: center;
-        background: #0b1426;
-        min-height: 135px;
-    }
-    .wf-green { border: 1.5px solid #10b981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.25); }
-    .wf-blue  { border: 1.5px solid #3b82f6; box-shadow: 0 0 15px rgba(59, 130, 246, 0.25); }
-    .wf-orange{ border: 1.5px solid #f97316; box-shadow: 0 0 15px rgba(249, 115, 22, 0.25); }
-    .wf-purple{ border: 1.5px solid #a855f7; box-shadow: 0 0 15px rgba(168, 85, 247, 0.25); }
-    .wf-teal  { border: 1.5px solid #06b6d4; box-shadow: 0 0 15px rgba(6, 182, 212, 0.25); }
-    .wf-title { font-size: 18px; font-weight: 800; color: #ffffff; margin: 4px 0; }
-    .wf-sub   { font-size: 12px; color: #94a3b8; margin-bottom: 8px; }
-    .wf-stat  { font-size: 12px; font-weight: 600; color: #34d399; }
-
-    .agent-col {
-        background: #0b1324;
-        border: 1px solid #1e293b;
-        border-radius: 12px;
-        padding: 12px;
-        min-height: 290px;
-    }
-    .chat-bubble {
-        background: #131f38;
-        border-left: 3px solid #38bdf8;
-        border-radius: 8px;
-        padding: 8px 10px;
-        margin-bottom: 8px;
-        font-size: 12.5px;
-        color: #e2e8f0;
-    }
-    .chat-time {
-        font-size: 10.5px;
-        color: #64748b;
-        display: block;
-        margin-bottom: 2px;
-    }
-    .panel-box {
-        background: #0b1324;
-        border: 1px solid #1e293b;
-        border-radius: 12px;
-        padding: 16px;
-        min-height: 250px;
-    }
-    .rec-ticker {
-        font-size: 24px;
-        font-weight: 800;
-        color: #34d399;
-        letter-spacing: 0.5px;
-    }
-    .metric-big {
-        font-size: 24px;
-        font-weight: 800;
-        color: #f8fafc;
-    }
-</style>
-""", unsafe_allow_html=True)
+RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
 
 
-@st.cache_data(ttl=120)
-def get_indian_indices():
-    indices = {"NIFTY 50": "^NSEI", "SENSEX": "^BSESN", "BANK NIFTY": "^NSEBANK"}
-    out = {}
-    for name, sym in indices.items():
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
+
+
+def init_db(initial_capital: float = 1_000_000.0):
+    with get_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, cash REAL)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, symbol TEXT, tier TEXT, status TEXT,
+                qty INTEGER, entry REAL, sl REAL, target REAL, exit_price REAL, pnl REAL, reason TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT, timestamp TEXT, sender TEXT, recipient TEXT,
+                msg_type TEXT, summary TEXT, payload_json TEXT
+            )
+        """)
+        if conn.execute("SELECT COUNT(*) FROM account").fetchone()[0] == 0:
+            conn.execute("INSERT INTO account (id, cash) VALUES (1, ?)", (initial_capital,))
+        conn.commit()
+
+
+def log_msg(cycle_id: str, sender: str, recipient: str, msg_type: str, summary: str, payload):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO agent_messages (cycle_id, timestamp, sender, recipient, msg_type, summary, payload_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                cycle_id,
+                now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+                sender,
+                recipient,
+                msg_type,
+                summary,
+                json.dumps(payload, indent=2),
+            ),
+        )
+        conn.commit()
+
+
+def fetch_nse_metrics() -> list[dict]:
+    snapshots = []
+    try:
+        data = yf.download(NSE_WATCHLIST, period="6mo", interval="1d", group_by="ticker", progress=False, threads=True)
+    except Exception:
+        return snapshots
+
+    for sym in NSE_WATCHLIST:
         try:
-            hist = yf.Ticker(sym).history(period="5d")
-            if len(hist) >= 2:
-                curr = float(hist["Close"].iloc[-1])
-                prev = float(hist["Close"].iloc[-2])
-                diff = curr - prev
-                pct = (diff / prev) * 100
-                out[name] = (curr, diff, pct, hist["Close"].tolist())
-            else:
-                out[name] = (24797.25, 182.75, 0.74, [24600, 24700, 24797])
+            hist = data[sym].dropna(subset=["Close"])
+            if len(hist) < 30:
+                continue
+            close, volume = hist["Close"], hist["Volume"]
+            ltp = float(close.iloc[-1])
+            sma_50 = float(close.rolling(min(50, len(hist))).mean().iloc[-1])
+            sma_200 = float(close.rolling(min(200, len(hist))).mean().iloc[-1])
+
+            delta = close.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss.replace(0, float("nan"))
+            rsi_val = (100 - (100 / (1 + rs))).iloc[-1]
+            rsi = float(rsi_val) if rsi_val == rsi_val else 50.0
+
+            atr = float((hist["High"] - hist["Low"]).rolling(14).mean().iloc[-1])
+            avg_vol = float(volume.rolling(20).mean().iloc[-1])
+            rvol = float(volume.iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
+
+            atr_pct = (atr / ltp) * 100
+            beta_proxy = round(max(0.6, min(2.0, atr_pct / 1.8)), 2)
+
+            snapshots.append({
+                "symbol": sym,
+                "ltp": round(ltp, 2),
+                "sma_50": round(sma_50, 2),
+                "sma_200": round(sma_200, 2),
+                "rsi_14": round(rsi, 2),
+                "atr_14": round(atr, 2),
+                "rvol": round(rvol, 2),
+                "beta": beta_proxy,
+                "day_change_pct": round(((ltp - float(close.iloc[-2])) / float(close.iloc[-2])) * 100, 2),
+            })
         except Exception:
-            out[name] = (24797.25, 182.75, 0.74, [24600, 24700, 24797])
-    return out
+            continue
+    return snapshots
 
 
-def is_nse_market_open(now_dt: datetime) -> bool:
-    if now_dt.weekday() >= 5:
-        return False
-    mins = now_dt.hour * 60 + now_dt.minute
-    return (9 * 60 + 15) <= mins <= (15 * 60 + 30)
+def fetch_nse_news(symbol: str) -> list[str]:
+    try:
+        clean_name = symbol.replace(".NS", "")
+        url = f"https://news.google.com/rss/search?q={quote(clean_name + ' NSE stock')}&hl=en-IN&gl=IN&ceid=IN:en"
+        feed = feedparser.parse(url)
+        return [entry.title for entry in feed.entries[:3]]
+    except Exception:
+        return ["No breaking news headlines"]
 
 
-current_ist = datetime.now(IST)
-market_open = is_nse_market_open(current_ist)
-
-# --- SIDEBAR NAVIGATION ---
-st.sidebar.markdown("## 📈 AI Stock Trader\n<span style='color:#94a3b8;font-size:12px;'>Multi-Agent NSE System</span>", unsafe_allow_html=True)
-st.sidebar.divider()
-
-nav = st.sidebar.radio(
-    "Navigation",
-    ["🏠 Live Dashboard", "🤖 Agent Monitor", "💬 Communication Log", "💼 Portfolio", "📜 Trade History"],
-    label_visibility="collapsed",
-)
-
-st.sidebar.divider()
-secret_key = ""
-try:
-    secret_key = st.secrets.get("GEMINI_API_KEY", "")
-except Exception:
-    secret_key = ""
-
-api_key = secret_key or os.environ.get("GEMINI_API_KEY", "")
-if not api_key:
-    api_key = st.sidebar.text_input("Gemini API Key", type="password")
-
-if st.sidebar.button("⚡ Run 5-Agent Cycle Now", use_container_width=True, type="primary"):
-    if not api_key:
-        st.sidebar.error("Add GEMINI_API_KEY in Secrets first.")
-    else:
+async def generate_fast(client, prompt: str, schema, temperature: float = 0.2):
+    last_error = None
+    for model_name in CANDIDATE_MODELS:
         try:
-            with st.spinner("AG1, AG2, AG3 scanning NSE → AG4 analyzing → AG5 executing..."):
-                asyncio.run(run_full_cycle(api_key))
-            st.toast("5-Agent Trading Cycle Completed!", icon="✅")
-        except Exception as e:
-            st.error(f"Cycle Notice: {e}")
-
-st.sidebar.markdown(
-    f"<div style='margin-top:24px;padding:10px;background:#0d1a2f;border-radius:8px;border:1px solid #1e3a5f;'>"
-    f"<span style='color:#34d399;font-weight:700;'>● System Online</span><br>"
-    f"<span style='color:#f8fafc;font-size:13px;font-weight:600;'>{current_ist.strftime('%H:%M:%S IST')}</span><br>"
-    f"<span style='color:#94a3b8;font-size:11px;'>{current_ist.strftime('%d %b %Y (%a)')}</span>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
-
-# --- LOAD DATABASE STATE ---
-conn = sqlite3.connect(DB_PATH, timeout=30.0)
-cash = conn.execute("SELECT cash FROM account WHERE id=1").fetchone()[0]
-trades_df = pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC", conn)
-msgs_df = pd.read_sql_query("SELECT * FROM agent_messages ORDER BY id DESC LIMIT 120", conn)
-conn.close()
-
-open_t = trades_df[trades_df["status"] == "OPEN"] if not trades_df.empty else pd.DataFrame()
-closed_t = trades_df[trades_df["status"] != "OPEN"] if not trades_df.empty else pd.DataFrame()
-invested = (open_t["qty"] * open_t["entry"]).sum() if not open_t.empty else 0.0
-total_portfolio = cash + invested
-realized_pnl = closed_t["pnl"].sum() if not closed_t.empty else 0.0
-overall_ret_pct = ((total_portfolio - 1_000_000.0) / 1_000_000.0) * 100
-
-indices = get_indian_indices()
-nifty_val, nifty_diff, nifty_pct, nifty_series = indices["NIFTY 50"]
-sensex_val, sensex_diff, sensex_pct, _ = indices["SENSEX"]
-bnifty_val, bnifty_diff, bnifty_pct, _ = indices["BANK NIFTY"]
-
-market_badge_text = "● NSE Market Open (IST)" if market_open else f"● NSE Closed • {current_ist.strftime('%I:%M %p IST')}"
-
-# --- TOP COMMAND BAR ---
-st.markdown(f"""
-<div class="top-bar">
-    <div>
-        <span class="platform-title">5-Agent Intelligent Stock Trading Platform</span>
-        <span style="margin-left:16px;color:#94a3b8;font-size:13px;">
-            NSE • <b>NIFTY 50</b> {nifty_val:,.2f} <span style="color:#34d399;">({nifty_pct:+.2f}%)</span>  | 
-            <b>SENSEX</b> {sensex_val:,.2f} <span style="color:#34d399;">({sensex_pct:+.2f}%)</span>
-        </span>
-    </div>
-    <div>
-        <span class="live-pill">{market_badge_text}</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+            coro = client.aio.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                    temperature=temperature,
+                ),
+            )
+            resp = await asyncio.wait_for(coro, timeout=12.0)
+            return json.loads(resp.text)
+        except (APIError, asyncio.TimeoutError) as e:
+            last_error = e
+            await asyncio.sleep(0.8)
+            continue
+    raise last_error
 
 
-def get_agent_msgs(sender_code: str, limit: int = 3):
-    if msgs_df.empty:
+def quant_fallback_screener(agent_id: str, data_slice: list[dict]) -> list[StockSignal]:
+    sorted_data = sorted(data_slice, key=lambda x: x["rvol"], reverse=True)[:2]
+    signals = []
+    for d in sorted_data:
+        atr = max(d["atr_14"], d["ltp"] * 0.01)
+        signals.append(
+            StockSignal(
+                agent_id=agent_id,
+                symbol=d["symbol"],
+                ltp=d["ltp"],
+                entry_price=d["ltp"],
+                stop_loss=round(d["ltp"] - 1.5 * atr, 2),
+                target_price=round(d["ltp"] + 3.0 * atr, 2),
+                rsi_14=d["rsi_14"],
+                rvol=d["rvol"],
+                beta=d["beta"],
+                setup_reason=f"Quant engine: RVOL {d['rvol']}x, RSI {d['rsi_14']}, ATR 1:2 R:R setup.",
+            )
+        )
+    return signals
+
+
+async def run_screener(client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict]) -> list[StockSignal]:
+    if not data_slice:
+        log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched this cycle.", [])
         return []
-    sub = msgs_df[msgs_df["sender"] == sender_code].head(limit)
-    return sub.to_dict("records")
+
+    prompt = (
+        f"You are {agent_id} for NSE India. {rules} "
+        f"From this NSE data, pick the 2 best stocks matching your risk tier with realistic INR "
+        f"entry_price, stop_loss, and target_price: {json.dumps(data_slice)}"
+    )
+    try:
+        raw = await generate_fast(client, prompt, list[StockSignal], temperature=0.2)
+        signals = [StockSignal(**item) for item in raw]
+        mode_tag = ""
+    except Exception:
+        signals = quant_fallback_screener(agent_id, data_slice)
+        mode_tag = " [Quant Engine]"
+
+    summary = (
+        f"Sent {len(signals)} stock(s) to AG4{mode_tag}: "
+        + ", ".join([f"{s.symbol} @ ₹{s.entry_price}" for s in signals])
+        if signals
+        else "No setups approved."
+    )
+    log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "CANDIDATE_PROPOSAL", summary, [s.model_dump() for s in signals])
+    return signals
 
 
-ag1_msgs = get_agent_msgs("AG1_LOW_RISK", 3)
-ag2_msgs = get_agent_msgs("AG2_MID_RISK", 3)
-ag3_msgs = get_agent_msgs("AG3_HIGH_RISK", 3)
-ag4_msgs = get_agent_msgs("AG4_CHIEF_ANALYST", 3)
-ag5_msgs = get_agent_msgs("AG5_EXECUTION_BROKER", 3)
-
-# ==============================================================================
-# VIEW 1: LIVE DASHBOARD
-# ==============================================================================
-if nav == "🏠 Live Dashboard":
-    top_left, top_right = st.columns([3.3, 1.3])
-
-    with top_left:
-        st.markdown("#### ⚡ 5-Agent Workflow & Communication Flow")
-        w1, a1, w2, a2, w3, a3, w4, a4, w5 = st.columns([1.8, 0.3, 1.8, 0.3, 1.8, 0.3, 2.0, 0.3, 1.8])
-
-        with w1:
-            st.markdown(f"""
-            <div class="wf-card wf-green">
-                <div style="font-size:22px;">🛡️</div>
-                <div class="wf-title">AG1</div>
-                <div class="wf-sub">Low Risk Analyst</div>
-                <div class="wf-stat">✓ {'Active' if ag1_msgs else 'Standby'}</div>
-            </div>""", unsafe_allow_html=True)
-        with a1:
-            st.markdown("<div style='text-align:center;padding-top:55px;font-size:22px;color:#64748b;'>→</div>", unsafe_allow_html=True)
-        with w2:
-            st.markdown(f"""
-            <div class="wf-card wf-blue">
-                <div style="font-size:22px;">📈</div>
-                <div class="wf-title">AG2</div>
-                <div class="wf-sub">Mid Risk Analyst</div>
-                <div class="wf-stat">✓ {'Active' if ag2_msgs else 'Standby'}</div>
-            </div>""", unsafe_allow_html=True)
-        with a2:
-            st.markdown("<div style='text-align:center;padding-top:55px;font-size:22px;color:#64748b;'>→</div>", unsafe_allow_html=True)
-        with w3:
-            st.markdown(f"""
-            <div class="wf-card wf-orange">
-                <div style="font-size:22px;">🚀</div>
-                <div class="wf-title">AG3</div>
-                <div class="wf-sub">High Risk Analyst</div>
-                <div class="wf-stat">✓ {'Active' if ag3_msgs else 'Standby'}</div>
-            </div>""", unsafe_allow_html=True)
-        with a3:
-            st.markdown("<div style='text-align:center;padding-top:55px;font-size:22px;color:#a855f7;'>⇉</div>", unsafe_allow_html=True)
-        with w4:
-            st.markdown(f"""
-            <div class="wf-card wf-purple">
-                <div style="font-size:22px;">🧠</div>
-                <div class="wf-title">AG4</div>
-                <div class="wf-sub">Final Analysis & Selection</div>
-                <div class="wf-stat">✓ {'Verified' if ag4_msgs else 'Waiting'}</div>
-            </div>""", unsafe_allow_html=True)
-        with a4:
-            st.markdown("<div style='text-align:center;padding-top:55px;font-size:22px;color:#06b6d4;'>→</div>", unsafe_allow_html=True)
-        with w5:
-            st.markdown(f"""
-            <div class="wf-card wf-teal">
-                <div style="font-size:22px;">🛒</div>
-                <div class="wf-title">AG5</div>
-                <div class="wf-sub">Execute Trades</div>
-                <div class="wf-stat">✓ {len(open_t)} Open</div>
-            </div>""", unsafe_allow_html=True)
-
-    with top_right:
-        st.markdown("#### 📊 Live Market Snapshot")
-        st.markdown(f"""
-        <div class="panel-box" style="min-height:135px;padding:12px;">
-            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
-                <span style="color:#94a3b8;">NIFTY 50</span>
-                <span><b>{nifty_val:,.2f}</b> <span style="color:#34d399;">{nifty_pct:+.2f}%</span></span>
-            </div>
-            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
-                <span style="color:#94a3b8;">SENSEX</span>
-                <span><b>{sensex_val:,.2f}</b> <span style="color:#34d399;">{sensex_pct:+.2f}%</span></span>
-            </div>
-            <div style="display:flex;justify-content:space-between;font-size:13px;">
-                <span style="color:#94a3b8;">BANK NIFTY</span>
-                <span><b>{bnifty_val:,.2f}</b> <span style="color:#34d399;">{bnifty_pct:+.2f}%</span></span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # --- MIDDLE ROW: 5 PARALLEL AGENT COMMUNICATION COLUMNS ---
-    st.markdown("#### 💬 Agent Communication — Live Chat Stream (IST)")
-    c_ag1, c_ag2, c_ag3, c_ag4, c_ag5 = st.columns(5)
-
-    def render_agent_column(col, title, border_color, records, empty_hint):
-        with col:
-            st.markdown(
-                f"<div class='agent-col' style='border-top: 3px solid {border_color};'>"
-                f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
-                f"<b style='font-size:13.5px;color:#f8fafc;'>{title}</b>"
-                f"<span style='color:#34d399;font-size:11px;'>● Online</span></div>",
-                unsafe_allow_html=True,
+async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> CommitteeOutput:
+    enriched = [{"signal": c.model_dump(), "news": fetch_nse_news(c.symbol)} for c in candidates]
+    prompt = (
+        "You are AG4, Chief Analyst for NSE India. Audit all candidates from AG1 (Low), AG2 (Mid), and AG3 (High) "
+        "with their news headlines. Mark each BUY or SKIP; approve 1-3 top setups with clean news and R:R >= 1:1.6. "
+        f"Inputs: {json.dumps(enriched)}"
+    )
+    try:
+        raw = await generate_fast(client, prompt, CommitteeOutput, temperature=0.1)
+        decision = CommitteeOutput(**raw)
+    except Exception:
+        tier_map = {"AG1_LOW_RISK": "LOW", "AG2_MID_RISK": "MID", "AG3_HIGH_RISK": "HIGH"}
+        fallback_trades, seen = [], set()
+        for c in candidates:
+            if c.symbol in seen:
+                continue
+            seen.add(c.symbol)
+            rr = (c.target_price - c.entry_price) / max(c.entry_price - c.stop_loss, 0.01)
+            action = "BUY" if rr >= 1.6 and len(fallback_trades) < 2 else "SKIP"
+            fallback_trades.append(
+                FinalDecision(
+                    symbol=c.symbol,
+                    risk_tier=tier_map[c.agent_id],
+                    action=action,
+                    conviction=76 if action == "BUY" else 50,
+                    entry_price=c.entry_price,
+                    stop_loss=c.stop_loss,
+                    target_price=c.target_price,
+                    news_status="CLEAR",
+                    reasoning=f"Quant audit: R:R = 1:{rr:.2f}, RSI = {c.rsi_14}, RVOL = {c.rvol}x.",
+                )
             )
-            if not records:
-                st.markdown(f"<div class='chat-bubble' style='border-left-color:{border_color};'>{empty_hint}</div>", unsafe_allow_html=True)
-            else:
-                for r in records:
-                    parts = r["timestamp"].split(" ")
-                    ts = " ".join(parts[1:]) if len(parts) > 1 else r["timestamp"]
-                    st.markdown(
-                        f"<div class='chat-bubble' style='border-left-color:{border_color};'>"
-                        f"<span class='chat-time'>🤖 {ts} • {r['cycle_id']}</span>"
-                        f"{r['summary']}</div>",
-                        unsafe_allow_html=True,
-                    )
-            st.markdown("</div>", unsafe_allow_html=True)
+        decision = CommitteeOutput(selected_trades=fallback_trades)
 
-    render_agent_column(c_ag1, "🛡️ AG1 – Low Risk", "#10b981", ag1_msgs, "Scanning low-beta NIFTY large caps...")
-    render_agent_column(c_ag2, "📈 AG2 – Mid Risk", "#3b82f6", ag2_msgs, "Scanning momentum & RVOL breakouts...")
-    render_agent_column(c_ag3, "🚀 AG3 – High Risk", "#f97316", ag3_msgs, "Scanning high-beta intraday movers...")
-    render_agent_column(c_ag4, "🧠 AG4 – Chief Analyst", "#a855f7", ag4_msgs, "Awaiting proposals + news sentiment audit...")
-    render_agent_column(c_ag5, "⚡ AG5 – Executor", "#06b6d4", ag5_msgs, "Monitoring bracket orders & SL/TP...")
+    buys = [d for d in decision.selected_trades if d.action == "BUY"]
+    log_msg(
+        cycle_id,
+        "AG4_CHIEF_ANALYST",
+        "AG5_EXECUTION_BROKER",
+        "VERDICT",
+        f"Approved {len(buys)} BUY order(s) out of {len(candidates)} proposals.",
+        decision.model_dump(),
+    )
+    return decision
 
-    st.markdown("<br>", unsafe_allow_html=True)
 
-    # --- BOTTOM ROW: FINAL RECOMMENDATION | PORTFOLIO PERFORMANCE | RECENT TRADE HISTORY ---
-    b1, b2, b3 = st.columns([1.2, 1.3, 1.5])
+def ag5_broker_step(cycle_id: str, decisions: list[FinalDecision], live_prices: dict[str, float]):
+    pending_logs = []
 
-    with b1:
-        st.markdown("#### 🏆 Final Recommendation (AG4)")
-        latest_buy = None
-        if ag4_msgs:
-            try:
-                payload = json.loads(ag4_msgs[0]["payload_json"])
-                trades_list = payload.get("selected_trades", [])
-                buys = [t for t in trades_list if t.get("action") == "BUY"]
-                if buys:
-                    latest_buy = buys[0]
-            except Exception:
-                pass
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cash = cur.execute("SELECT cash FROM account WHERE id=1").fetchone()[0]
 
-        if latest_buy:
-            rr_val = round(
-                (latest_buy["target_price"] - latest_buy["entry_price"])
-                / max(latest_buy["entry_price"] - latest_buy["stop_loss"], 0.01),
-                1,
-            )
-            st.markdown(f"""
-            <div class="panel-box">
-                <div class="rec-ticker">{latest_buy['symbol']}</div>
-                <div style="color:#94a3b8;font-size:12px;margin-bottom:10px;">Tier: <b>{latest_buy['risk_tier']}</b> • Conviction: <b>{latest_buy['conviction']}%</b></div>
-                <div style="font-size:13px;line-height:1.8;">
-                    <b>Entry Price:</b> ₹{latest_buy['entry_price']:,.2f}<br>
-                    <b>Stop Loss:</b> <span style="color:#f87171;">₹{latest_buy['stop_loss']:,.2f}</span><br>
-                    <b>Target Price:</b> <span style="color:#34d399;">₹{latest_buy['target_price']:,.2f}</span><br>
-                    <b>Risk / Reward:</b> 1 : {rr_val}
-                </div>
-                <div style="margin-top:10px;padding:8px;background:#131f38;border-radius:8px;font-size:12px;color:#cbd5e1;">
-                    ✓ {latest_buy['reasoning']}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div class="panel-box">
-                <div class="rec-ticker">READY TO SCAN</div>
-                <p style="color:#94a3b8;font-size:13px;">Click <b>⚡ Run 5-Agent Cycle Now</b> in the left sidebar to generate AG4's highest-conviction NSE stock pick.</p>
-            </div>
-            """, unsafe_allow_html=True)
+        for tid, sym, qty, entry, sl, target in cur.execute(
+            "SELECT id, symbol, qty, entry, sl, target FROM trades WHERE status='OPEN'"
+        ).fetchall():
+            ltp = live_prices.get(sym)
+            if ltp and (ltp <= sl or ltp >= target):
+                outcome = "TARGET_HIT" if ltp >= target else "SL_HIT"
+                pnl = round((ltp - entry) * qty, 2)
+                cash += ltp * qty
+                cur.execute("UPDATE account SET cash=?", (cash,))
+                cur.execute("UPDATE trades SET status=?, exit_price=?, pnl=? WHERE id=?", (outcome, ltp, pnl, tid))
+                pending_logs.append((
+                    outcome,
+                    f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}",
+                    {"symbol": sym, "pnl": pnl},
+                ))
 
-    with b2:
-        st.markdown("#### 💼 Portfolio & Performance")
-        st.markdown(f"""
-        <div class="panel-box">
-            <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
-                <div>
-                    <div style="color:#94a3b8;font-size:12px;">Total Portfolio Value</div>
-                    <div class="metric-big">₹{total_portfolio:,.2f}</div>
-                    <div style="color:#34d399;font-size:12px;">{overall_ret_pct:+.2f}% overall</div>
-                </div>
-                <div>
-                    <div style="color:#94a3b8;font-size:12px;">Realized P&L</div>
-                    <div class="metric-big" style="color:{'#34d399' if realized_pnl >= 0 else '#f87171'};">₹{realized_pnl:,.2f}</div>
-                    <div style="color:#94a3b8;font-size:12px;">Cash: ₹{cash:,.0f}</div>
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
-        chart_data = pd.DataFrame({"NIFTY 50 Trend": nifty_series})
-        st.line_chart(chart_data, height=130)
-        st.markdown("</div>", unsafe_allow_html=True)
+        for d in decisions:
+            if d.action != "BUY" or d.conviction < 65:
+                continue
+            if cur.execute("SELECT id FROM trades WHERE symbol=? AND status='OPEN'", (d.symbol,)).fetchone():
+                continue
+            risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
+            qty = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
+            cost = qty * d.entry_price
+            if qty > 0 and cost <= cash * 0.25:
+                cash -= cost
+                cur.execute("UPDATE account SET cash=?", (cash,))
+                cur.execute(
+                    """INSERT INTO trades (timestamp, symbol, tier, status, qty, entry, sl, target, reason)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+                        d.symbol,
+                        d.risk_tier,
+                        "OPEN",
+                        qty,
+                        d.entry_price,
+                        d.stop_loss,
+                        d.target_price,
+                        d.reasoning,
+                    ),
+                )
+                pending_logs.append((
+                    "PAPER_BUY",
+                    f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
+                    d.model_dump(),
+                ))
 
-    with b3:
-        st.markdown("#### 📜 Recent Trade History (IST)")
-        if trades_df.empty:
-            st.markdown("""
-            <div class="panel-box">
-                <p style="color:#94a3b8;font-size:13px;">No paper orders executed yet. When AG4 approves a BUY signal, AG5 will automatically size the position and log it here.</p>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            display_df = trades_df[["timestamp", "symbol", "tier", "qty", "entry", "status", "pnl"]].head(6).copy()
-            display_df["timestamp"] = display_df["timestamp"].apply(lambda x: " ".join(x.split(" ")[1:]) if len(x.split(" ")) > 1 else x)
-            display_df.columns = ["Time (IST)", "Stock", "Tier", "Qty", "Price (₹)", "Status", "P&L (₹)"]
-            st.dataframe(display_df, use_container_width=True, hide_index=True, height=250)
+        conn.commit()
 
-# ==============================================================================
-# VIEW 2: AGENT MONITOR
-# ==============================================================================
-elif nav == "🤖 Agent Monitor":
-    st.subheader("🤖 Individual Agent Roles & Latest Outputs")
-    selected_tab = st.tabs(["AG1 (Low Risk)", "AG2 (Mid Risk)", "AG3 (High Risk)", "AG4 (Chief Analyst)", "AG5 (Executor)"])
-    codes = ["AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK", "AG4_CHIEF_ANALYST", "AG5_EXECUTION_BROKER"]
-    descriptions = [
-        "Scans liquid NSE large-caps with low Beta, healthy trend above 200-SMA, and tight ATR stop-losses.",
-        "Scans mid-to-large growth stocks with strong relative volume (RVOL) and momentum breakouts.",
-        "Scans high-beta, high-volatility intraday movers with strict 1x ATR invalidation levels.",
-        "Audits all proposals from AG1–AG3 against live Google News RSS headlines and technical risk/reward ratios.",
-        "Calculates tier-adjusted position size on ₹10L virtual capital and executes bracket BUY/SELL orders.",
-    ]
-    for tab, code, desc in zip(selected_tab, codes, descriptions):
-        with tab:
-            st.info(f"**Role & Responsibilities:** {desc}")
-            sub = msgs_df[msgs_df["sender"] == code] if not msgs_df.empty else pd.DataFrame()
-            if sub.empty:
-                st.write("No logs recorded for this agent yet.")
-            else:
-                for _, r in sub.head(10).iterrows():
-                    st.markdown(f"**`{r['timestamp']}` ({r['cycle_id']})** — {r['summary']}")
-                    with st.expander("Inspect Structured JSON"):
-                        st.code(r["payload_json"], language="json")
+    for msg_type, summary, payload in pending_logs:
+        log_msg(cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", msg_type, summary, payload)
 
-# ==============================================================================
-# VIEW 3: FULL COMMUNICATION LOG
-# ==============================================================================
-elif nav == "💬 Communication Log":
-    st.subheader("💬 Complete Inter-Agent Audit Log (IST)")
-    if msgs_df.empty:
-        st.info("No inter-agent messages logged yet.")
-    else:
-        for _, r in msgs_df.iterrows():
-            with st.chat_message("assistant"):
-                st.markdown(f"**`{r['cycle_id']}` | `{r['timestamp']}`** — **{r['sender']}** ➡️ **{r['recipient']}**")
-                st.write(r["summary"])
-                with st.expander("Raw Payload"):
-                    st.code(r["payload_json"], language="json")
 
-# ==============================================================================
-# VIEW 4: PORTFOLIO
-# ==============================================================================
-elif nav == "💼 Portfolio":
-    st.subheader("💼 Active Virtual NSE Holdings")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Available Cash", f"₹{cash:,.2f}")
-    c2.metric("Invested Capital", f"₹{invested:,.2f}")
-    c3.metric("Total Account Equity", f"₹{total_portfolio:,.2f}", f"{overall_ret_pct:+.2f}%")
-    st.divider()
-    st.dataframe(open_t, use_container_width=True, hide_index=True) if not open_t.empty else st.write("No open positions currently held.")
+async def run_full_cycle(api_key: str):
+    client = genai.Client(api_key=api_key.strip())
+    cycle_id = now_ist().strftime("CYC-%H%M%S-IST")
+    market_data = fetch_nse_metrics()
+    live_prices = {m["symbol"]: m["ltp"] for m in market_data}
 
-# ==============================================================================
-# VIEW 5: TRADE HISTORY
-# ==============================================================================
-elif nav == "📜 Trade History":
-    st.subheader("📜 Complete 30-Day Demo Trade Ledger (IST)")
-    st.dataframe(trades_df, use_container_width=True, hide_index=True) if not trades_df.empty else st.write("No trades recorded yet.")
+    ag1_slice = [d for d in market_data if d["beta"] <= 1.05] or market_data
+    ag2_slice = [d for d in market_data if 0.85 <= d["beta"] <= 1.55] or market_data
+    ag3_slice = [d for d in market_data if d["beta"] >= 1.15 or abs(d["day_change_pct"]) >= 1.2] or market_data
+
+    ag1 = await run_screener(
+        client, cycle_id, "AG1_LOW_RISK",
+        "Focus on LOW-RISK large-cap stability (lowest beta, price near/above 200-SMA, tight 1.5x ATR stop).",
+        ag1_slice,
+    )
+    ag2 = await run_screener(
+        client, cycle_id, "AG2_MID_RISK",
+        "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
+        ag2_slice,
+    )
+    ag3 = await run_screener(
+        client, cycle_id, "AG3_HIGH_RISK",
+        "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move, tight 1x ATR stop).",
+        ag3_slice,
+    )
+
+    candidates = ag1 + ag2 + ag3
+    decisions = (await run_ag4(client, cycle_id, candidates)).selected_trades if candidates else []
+    ag5_broker_step(cycle_id, decisions, live_prices)
