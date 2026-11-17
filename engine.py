@@ -24,50 +24,54 @@ NSE_WATCHLIST = [
 RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
 
 
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
+
+
 def init_db(initial_capital: float = 1_000_000.0):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, cash REAL)")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT, symbol TEXT, tier TEXT, status TEXT,
-            qty INTEGER, entry REAL, sl REAL, target REAL, exit_price REAL, pnl REAL, reason TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS agent_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cycle_id TEXT, timestamp TEXT, sender TEXT, recipient TEXT,
-            msg_type TEXT, summary TEXT, payload_json TEXT
-        )
-    """)
-    if conn.execute("SELECT COUNT(*) FROM account").fetchone()[0] == 0:
-        conn.execute("INSERT INTO account (id, cash) VALUES (1, ?)", (initial_capital,))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, cash REAL)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, symbol TEXT, tier TEXT, status TEXT,
+                qty INTEGER, entry REAL, sl REAL, target REAL, exit_price REAL, pnl REAL, reason TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT, timestamp TEXT, sender TEXT, recipient TEXT,
+                msg_type TEXT, summary TEXT, payload_json TEXT
+            )
+        """)
+        if conn.execute("SELECT COUNT(*) FROM account").fetchone()[0] == 0:
+            conn.execute("INSERT INTO account (id, cash) VALUES (1, ?)", (initial_capital,))
+        conn.commit()
 
 
 def log_msg(cycle_id: str, sender: str, recipient: str, msg_type: str, summary: str, payload):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """INSERT INTO agent_messages (cycle_id, timestamp, sender, recipient, msg_type, summary, payload_json)
-           VALUES (?,?,?,?,?,?,?)""",
-        (
-            cycle_id,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            sender,
-            recipient,
-            msg_type,
-            summary,
-            json.dumps(payload, indent=2),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO agent_messages (cycle_id, timestamp, sender, recipient, msg_type, summary, payload_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                cycle_id,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                sender,
+                recipient,
+                msg_type,
+                summary,
+                json.dumps(payload, indent=2),
+            ),
+        )
+        conn.commit()
 
 
 def fetch_nse_metrics() -> list[dict]:
-    """Batch-downloads all NSE tickers in a single fast request (~2 seconds)."""
     snapshots = []
     try:
         data = yf.download(NSE_WATCHLIST, period="6mo", interval="1d", group_by="ticker", progress=False, threads=True)
@@ -95,7 +99,6 @@ def fetch_nse_metrics() -> list[dict]:
             avg_vol = float(volume.rolling(20).mean().iloc[-1])
             rvol = float(volume.iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
 
-            # Estimate volatility proxy from ATR % instead of slow per-ticker .info HTTP calls
             atr_pct = (atr / ltp) * 100
             beta_proxy = round(max(0.6, min(2.0, atr_pct / 1.8)), 2)
 
@@ -126,7 +129,6 @@ def fetch_nse_news(symbol: str) -> list[str]:
 
 
 async def generate_fast(client, prompt: str, schema, temperature: float = 0.2):
-    """Hard 12-second timeout per LLM call so the UI never hangs."""
     last_error = None
     for model_name in CANDIDATE_MODELS:
         try:
@@ -245,66 +247,67 @@ async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> Commi
 
 
 def ag5_broker_step(cycle_id: str, decisions: list[FinalDecision], live_prices: dict[str, float]):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cash = cur.execute("SELECT cash FROM account WHERE id=1").fetchone()[0]
+    pending_logs = []
 
-    for tid, sym, qty, entry, sl, target in cur.execute(
-        "SELECT id, symbol, qty, entry, sl, target FROM trades WHERE status='OPEN'"
-    ).fetchall():
-        ltp = live_prices.get(sym)
-        if ltp and (ltp <= sl or ltp >= target):
-            outcome = "TARGET_HIT" if ltp >= target else "SL_HIT"
-            pnl = round((ltp - entry) * qty, 2)
-            cash += ltp * qty
-            cur.execute("UPDATE account SET cash=?", (cash,))
-            cur.execute("UPDATE trades SET status=?, exit_price=?, pnl=? WHERE id=?", (outcome, ltp, pnl, tid))
-            log_msg(
-                cycle_id,
-                "AG5_EXECUTION_BROKER",
-                "PORTFOLIO_LEDGER",
-                outcome,
-                f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}",
-                {"symbol": sym, "pnl": pnl},
-            )
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cash = cur.execute("SELECT cash FROM account WHERE id=1").fetchone()[0]
 
-    for d in decisions:
-        if d.action != "BUY" or d.conviction < 65:
-            continue
-        if cur.execute("SELECT id FROM trades WHERE symbol=? AND status='OPEN'", (d.symbol,)).fetchone():
-            continue
-        risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
-        qty = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
-        cost = qty * d.entry_price
-        if qty > 0 and cost <= cash * 0.25:
-            cash -= cost
-            cur.execute("UPDATE account SET cash=?", (cash,))
-            cur.execute(
-                """INSERT INTO trades (timestamp, symbol, tier, status, qty, entry, sl, target, reason)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    d.symbol,
-                    d.risk_tier,
-                    "OPEN",
-                    qty,
-                    d.entry_price,
-                    d.stop_loss,
-                    d.target_price,
-                    d.reasoning,
-                ),
-            )
-            log_msg(
-                cycle_id,
-                "AG5_EXECUTION_BROKER",
-                "PORTFOLIO_LEDGER",
-                "PAPER_BUY",
-                f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
-                d.model_dump(),
-            )
+        # 1. Check exits on open positions
+        for tid, sym, qty, entry, sl, target in cur.execute(
+            "SELECT id, symbol, qty, entry, sl, target FROM trades WHERE status='OPEN'"
+        ).fetchall():
+            ltp = live_prices.get(sym)
+            if ltp and (ltp <= sl or ltp >= target):
+                outcome = "TARGET_HIT" if ltp >= target else "SL_HIT"
+                pnl = round((ltp - entry) * qty, 2)
+                cash += ltp * qty
+                cur.execute("UPDATE account SET cash=?", (cash,))
+                cur.execute("UPDATE trades SET status=?, exit_price=?, pnl=? WHERE id=?", (outcome, ltp, pnl, tid))
+                pending_logs.append((
+                    outcome,
+                    f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}",
+                    {"symbol": sym, "pnl": pnl},
+                ))
 
-    conn.commit()
-    conn.close()
+        # 2. Execute new virtual BUY orders
+        for d in decisions:
+            if d.action != "BUY" or d.conviction < 65:
+                continue
+            if cur.execute("SELECT id FROM trades WHERE symbol=? AND status='OPEN'", (d.symbol,)).fetchone():
+                continue
+            risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
+            qty = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
+            cost = qty * d.entry_price
+            if qty > 0 and cost <= cash * 0.25:
+                cash -= cost
+                cur.execute("UPDATE account SET cash=?", (cash,))
+                cur.execute(
+                    """INSERT INTO trades (timestamp, symbol, tier, status, qty, entry, sl, target, reason)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        d.symbol,
+                        d.risk_tier,
+                        "OPEN",
+                        qty,
+                        d.entry_price,
+                        d.stop_loss,
+                        d.target_price,
+                        d.reasoning,
+                    ),
+                )
+                pending_logs.append((
+                    "PAPER_BUY",
+                    f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
+                    d.model_dump(),
+                ))
+
+        conn.commit()
+
+    # Log to agent_messages AFTER the trade transaction is cleanly committed and closed
+    for msg_type, summary, payload in pending_logs:
+        log_msg(cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", msg_type, summary, payload)
 
 
 async def run_full_cycle(api_key: str):
