@@ -3,6 +3,7 @@ import json
 import asyncio
 import sqlite3
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import yfinance as yf
 import feedparser
@@ -11,6 +12,7 @@ from google.genai import types
 from google.genai.errors import APIError
 from schemas import StockSignal, CommitteeOutput, FinalDecision
 
+IST = ZoneInfo("Asia/Kolkata")
 DB_PATH = "nse_demo_trades.db"
 CANDIDATE_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
@@ -22,6 +24,10 @@ NSE_WATCHLIST = [
 ]
 
 RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
 
 
 def get_conn():
@@ -60,7 +66,7 @@ def log_msg(cycle_id: str, sender: str, recipient: str, msg_type: str, summary: 
                VALUES (?,?,?,?,?,?,?)""",
             (
                 cycle_id,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
                 sender,
                 recipient,
                 msg_type,
@@ -174,168 +180,4 @@ def quant_fallback_screener(agent_id: str, data_slice: list[dict]) -> list[Stock
 
 async def run_screener(client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict]) -> list[StockSignal]:
     if not data_slice:
-        log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched this cycle.", [])
-        return []
-
-    prompt = (
-        f"You are {agent_id} for NSE India. {rules} "
-        f"From this NSE data, pick the 2 best stocks matching your risk tier with realistic INR "
-        f"entry_price, stop_loss, and target_price: {json.dumps(data_slice)}"
-    )
-    try:
-        raw = await generate_fast(client, prompt, list[StockSignal], temperature=0.2)
-        signals = [StockSignal(**item) for item in raw]
-        mode_tag = ""
-    except Exception:
-        signals = quant_fallback_screener(agent_id, data_slice)
-        mode_tag = " [Quant Engine]"
-
-    summary = (
-        f"Sent {len(signals)} stock(s) to AG4{mode_tag}: "
-        + ", ".join([f"{s.symbol} @ ₹{s.entry_price}" for s in signals])
-        if signals
-        else "No setups approved."
-    )
-    log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "CANDIDATE_PROPOSAL", summary, [s.model_dump() for s in signals])
-    return signals
-
-
-async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> CommitteeOutput:
-    enriched = [{"signal": c.model_dump(), "news": fetch_nse_news(c.symbol)} for c in candidates]
-    prompt = (
-        "You are AG4, Chief Analyst for NSE India. Audit all candidates from AG1 (Low), AG2 (Mid), and AG3 (High) "
-        "with their news headlines. Mark each BUY or SKIP; approve 1-3 top setups with clean news and R:R >= 1:1.6. "
-        f"Inputs: {json.dumps(enriched)}"
-    )
-    try:
-        raw = await generate_fast(client, prompt, CommitteeOutput, temperature=0.1)
-        decision = CommitteeOutput(**raw)
-    except Exception:
-        tier_map = {"AG1_LOW_RISK": "LOW", "AG2_MID_RISK": "MID", "AG3_HIGH_RISK": "HIGH"}
-        fallback_trades, seen = [], set()
-        for c in candidates:
-            if c.symbol in seen:
-                continue
-            seen.add(c.symbol)
-            rr = (c.target_price - c.entry_price) / max(c.entry_price - c.stop_loss, 0.01)
-            action = "BUY" if rr >= 1.6 and len(fallback_trades) < 2 else "SKIP"
-            fallback_trades.append(
-                FinalDecision(
-                    symbol=c.symbol,
-                    risk_tier=tier_map[c.agent_id],
-                    action=action,
-                    conviction=76 if action == "BUY" else 50,
-                    entry_price=c.entry_price,
-                    stop_loss=c.stop_loss,
-                    target_price=c.target_price,
-                    news_status="CLEAR",
-                    reasoning=f"Quant audit: R:R = 1:{rr:.2f}, RSI = {c.rsi_14}, RVOL = {c.rvol}x.",
-                )
-            )
-        decision = CommitteeOutput(selected_trades=fallback_trades)
-
-    buys = [d for d in decision.selected_trades if d.action == "BUY"]
-    log_msg(
-        cycle_id,
-        "AG4_CHIEF_ANALYST",
-        "AG5_EXECUTION_BROKER",
-        "VERDICT",
-        f"Approved {len(buys)} BUY order(s) out of {len(candidates)} proposals.",
-        decision.model_dump(),
-    )
-    return decision
-
-
-def ag5_broker_step(cycle_id: str, decisions: list[FinalDecision], live_prices: dict[str, float]):
-    pending_logs = []
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cash = cur.execute("SELECT cash FROM account WHERE id=1").fetchone()[0]
-
-        # 1. Check exits on open positions
-        for tid, sym, qty, entry, sl, target in cur.execute(
-            "SELECT id, symbol, qty, entry, sl, target FROM trades WHERE status='OPEN'"
-        ).fetchall():
-            ltp = live_prices.get(sym)
-            if ltp and (ltp <= sl or ltp >= target):
-                outcome = "TARGET_HIT" if ltp >= target else "SL_HIT"
-                pnl = round((ltp - entry) * qty, 2)
-                cash += ltp * qty
-                cur.execute("UPDATE account SET cash=?", (cash,))
-                cur.execute("UPDATE trades SET status=?, exit_price=?, pnl=? WHERE id=?", (outcome, ltp, pnl, tid))
-                pending_logs.append((
-                    outcome,
-                    f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}",
-                    {"symbol": sym, "pnl": pnl},
-                ))
-
-        # 2. Execute new virtual BUY orders
-        for d in decisions:
-            if d.action != "BUY" or d.conviction < 65:
-                continue
-            if cur.execute("SELECT id FROM trades WHERE symbol=? AND status='OPEN'", (d.symbol,)).fetchone():
-                continue
-            risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
-            qty = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
-            cost = qty * d.entry_price
-            if qty > 0 and cost <= cash * 0.25:
-                cash -= cost
-                cur.execute("UPDATE account SET cash=?", (cash,))
-                cur.execute(
-                    """INSERT INTO trades (timestamp, symbol, tier, status, qty, entry, sl, target, reason)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        d.symbol,
-                        d.risk_tier,
-                        "OPEN",
-                        qty,
-                        d.entry_price,
-                        d.stop_loss,
-                        d.target_price,
-                        d.reasoning,
-                    ),
-                )
-                pending_logs.append((
-                    "PAPER_BUY",
-                    f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
-                    d.model_dump(),
-                ))
-
-        conn.commit()
-
-    # Log to agent_messages AFTER the trade transaction is cleanly committed and closed
-    for msg_type, summary, payload in pending_logs:
-        log_msg(cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", msg_type, summary, payload)
-
-
-async def run_full_cycle(api_key: str):
-    client = genai.Client(api_key=api_key.strip())
-    cycle_id = datetime.now().strftime("CYC-%H%M%S")
-    market_data = fetch_nse_metrics()
-    live_prices = {m["symbol"]: m["ltp"] for m in market_data}
-
-    ag1_slice = [d for d in market_data if d["beta"] <= 1.05] or market_data
-    ag2_slice = [d for d in market_data if 0.85 <= d["beta"] <= 1.55] or market_data
-    ag3_slice = [d for d in market_data if d["beta"] >= 1.15 or abs(d["day_change_pct"]) >= 1.2] or market_data
-
-    ag1 = await run_screener(
-        client, cycle_id, "AG1_LOW_RISK",
-        "Focus on LOW-RISK large-cap stability (lowest beta, price near/above 200-SMA, tight 1.5x ATR stop).",
-        ag1_slice,
-    )
-    ag2 = await run_screener(
-        client, cycle_id, "AG2_MID_RISK",
-        "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
-        ag2_slice,
-    )
-    ag3 = await run_screener(
-        client, cycle_id, "AG3_HIGH_RISK",
-        "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move, tight 1x ATR stop).",
-        ag3_slice,
-    )
-
-    candidates = ag1 + ag2 + ag3
-    decisions = (await run_ag4(client, cycle_id, candidates)).selected_trades if candidates else []
-    ag5_broker_step(cycle_id, decisions, live_prices)
+        log_msg(cycle_id, agent_id, "AG
