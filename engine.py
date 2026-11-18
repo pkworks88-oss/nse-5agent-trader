@@ -31,11 +31,14 @@ def now_ist() -> datetime:
 
 
 def get_gsheet_client(gcp_creds_dict: dict):
+    creds_copy = dict(gcp_creds_dict)
+    if "private_key" in creds_copy:
+        creds_copy["private_key"] = creds_copy["private_key"].replace("\\n", "\n")
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(gcp_creds_dict, scopes=scopes)
+    creds = Credentials.from_service_account_info(creds_copy, scopes=scopes)
     gc = gspread.authorize(creds)
     return gc.open(SHEET_NAME)
 
