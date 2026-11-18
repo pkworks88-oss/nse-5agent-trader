@@ -75,8 +75,17 @@ def is_nse_market_open(now_dt: datetime) -> bool:
 current_ist = get_ist_now()
 market_open = is_nse_market_open(current_ist)
 
+# --- LOAD SECRETS SAFELY ---
 api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
-gcp_creds = dict(st.secrets["gcp_service_account"])
+
+if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+    raw_gcp = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+    gcp_creds = json.loads(raw_gcp) if isinstance(raw_gcp, str) else dict(raw_gcp)
+elif "gcp_service_account" in st.secrets:
+    gcp_creds = dict(st.secrets["gcp_service_account"])
+else:
+    st.error("Missing `GCP_SERVICE_ACCOUNT_JSON` in Streamlit Secrets. Add your Google Cloud JSON key in Manage app → Settings → Secrets.")
+    st.stop()
 
 # --- SIDEBAR ---
 st.sidebar.markdown("## 📈 AI Stock Trader\n<span style='color:#94a3b8;font-size:12px;'>24/7 Cloud NSE System</span>", unsafe_allow_html=True)
