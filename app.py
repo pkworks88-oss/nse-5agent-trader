@@ -22,14 +22,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# --- CYBER-TERMINAL STYLING ---
+# --- RESPONSIVE CYBER-TERMINAL STYLING (LAPTOP + MOBILE) ---
 st.markdown("""
 <style>
     .stApp { background: radial-gradient(circle at top right, #0f1c36 0%, #070d19 60%, #050912 100%); color: #e2e8f0; }
     section[data-testid="stSidebar"] { background-color: #081020; border-right: 1px solid #1e293b; }
     .top-bar { display: flex; justify-content: space-between; align-items: center; background: linear-gradient(90deg, #0d172a 0%, #111f38 100%); border: 1px solid #1e3a5f; border-radius: 12px; padding: 12px 20px; margin-bottom: 12px; }
     .platform-title { font-size: 21px; font-weight: 800; color: #f8fafc; margin: 0; }
-    .live-pill { background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; color: #34d399; padding: 4px 12px; border-radius: 20px; font-size: 12.5px; font-weight: 600; }
+    .top-ticker-strip { margin-left: 14px; color: #94a3b8; font-size: 13px; }
+    .live-pill { background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; color: #34d399; padding: 4px 12px; border-radius: 20px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
     .wf-card { border-radius: 12px; padding: 14px 10px; text-align: center; background: #0b1426; min-height: 130px; }
     .wf-green { border: 1.5px solid #10b981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.22); }
     .wf-blue  { border: 1.5px solid #3b82f6; box-shadow: 0 0 15px rgba(59, 130, 246, 0.22); }
@@ -39,14 +40,15 @@ st.markdown("""
     .wf-title { font-size: 17px; font-weight: 800; color: #ffffff; margin: 4px 0; }
     .wf-sub   { font-size: 11.5px; color: #94a3b8; margin-bottom: 6px; }
     .wf-stat  { font-size: 12px; font-weight: 600; color: #34d399; }
+    .wf-arrow { text-align: center; padding-top: 50px; font-size: 22px; color: #64748b; }
     .agent-col { background: #0b1324; border: 1px solid #1e293b; border-radius: 12px; padding: 12px; min-height: 290px; }
     .chat-bubble { background: #131f38; border-left: 3px solid #38bdf8; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-size: 12.5px; color: #e2e8f0; }
     .chat-time { font-size: 10.5px; color: #64748b; display: block; margin-bottom: 2px; }
     .panel-box { background: #0b1324; border: 1px solid #1e293b; border-radius: 12px; padding: 16px; }
     .rec-ticker { font-size: 24px; font-weight: 800; color: #34d399; letter-spacing: 0.5px; }
     .metric-big { font-size: 23px; font-weight: 800; color: #f8fafc; }
+    .status-strip { text-align: right; padding-top: 6px; color: #94a3b8; font-size: 12.5px; }
 
-    /* Interactive Top Navigation Tabs */
     div[data-testid="stTabs"] button {
         background-color: #0d172a;
         border: 1px solid #1e293b;
@@ -59,6 +61,23 @@ st.markdown("""
         background-color: #132342;
         border-color: #38bdf8;
         color: #ffffff;
+    }
+
+    /* MOBILE PHONE ADAPTATIONS (≤ 768px) */
+    @media (max-width: 768px) {
+        .block-container { padding-top: 1rem !important; padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
+        .top-bar { flex-direction: column; align-items: flex-start; gap: 8px; padding: 12px 14px; }
+        .platform-title { font-size: 17px; line-height: 1.3; }
+        .top-ticker-strip { margin-left: 0; display: block; margin-top: 4px; font-size: 12px; }
+        .live-pill { font-size: 11.5px; padding: 3px 10px; }
+        .status-strip { text-align: left; padding-top: 4px; font-size: 12px; }
+        .wf-card { min-height: auto; padding: 10px 8px; margin-bottom: 4px; }
+        .wf-arrow { display: none !important; }
+        .agent-col { min-height: auto; margin-bottom: 8px; padding: 10px; }
+        .panel-box { min-height: auto !important; margin-bottom: 10px; padding: 12px; }
+        .rec-ticker { font-size: 20px; }
+        .metric-big { font-size: 19px; }
+        div[data-testid="stTabs"] button { padding: 6px 10px; font-size: 12px; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -130,7 +149,6 @@ else:
     st.error("Missing `GCP_SERVICE_ACCOUNT_JSON` in Streamlit Secrets.")
     st.stop()
 
-# --- LOAD LIVE CLOUD STATE FROM GOOGLE SHEETS ---
 sh = get_gsheet_client(gcp_creds)
 cash = float(sh.worksheet("account").acell("A2").value or 1_000_000.0)
 trades_records = sh.worksheet("trades").get_all_records()
@@ -153,11 +171,9 @@ if not open_t.empty:
     open_t["live_ltp"] = open_t["symbol"].map(live_ltp_map).fillna(open_t["entry"])
     open_t["unrealized_pnl"] = ((open_t["live_ltp"] - open_t["entry"]) * open_t["qty"]).round(2)
     open_t["pnl_pct"] = (((open_t["live_ltp"] - open_t["entry"]) / open_t["entry"]) * 100).round(2)
-    invested_cost = (open_t["qty"] * open_t["entry"]).sum()
     current_holdings_val = (open_t["qty"] * open_t["live_ltp"]).sum()
     unrealized_pnl_total = open_t["unrealized_pnl"].sum()
 else:
-    invested_cost = 0.0
     current_holdings_val = 0.0
     unrealized_pnl_total = 0.0
 
@@ -176,12 +192,11 @@ market_badge_text = (
     else f"● NSE Closed • {current_ist.strftime('%I:%M:%S %p IST')}"
 )
 
-# --- TOP COMMAND BAR & ACTION CONTROLS ---
 st.markdown(f"""
 <div class="top-bar">
     <div>
         <span class="platform-title">5-Agent Intelligent Stock Trading Platform</span>
-        <span style="margin-left:14px;color:#94a3b8;font-size:13px;">
+        <span class="top-ticker-strip">
             <b>NIFTY 50</b> {nifty_val:,.2f} <span style="color:#34d399;">({nifty_pct:+.2f}%)</span>  | 
             <b>SENSEX</b> {sensex_val:,.2f} <span style="color:#34d399;">({sensex_pct:+.2f}%)</span>  | 
             <b>Equity:</b> <span style="color:#f8fafc;">₹{total_portfolio:,.2f}</span>
@@ -207,9 +222,9 @@ with ctrl3:
     auto_refresh = st.toggle("⏱️ Auto-Refresh (60s)", value=False)
 with ctrl4:
     st.markdown(
-        f"<div style='text-align:right;padding-top:6px;color:#94a3b8;font-size:12.5px;'>"
-        f"📅 {current_ist.strftime('%d %b %Y (%A)')}  |  Cash: <b style='color:#f8fafc;'>₹{cash:,.2f}</b>  |  "
-        f"Live Unrealized P&L: <b style='color:{'#34d399' if unrealized_pnl_total >= 0 else '#f87171'};'>₹{unrealized_pnl_total:+,.2f}</b>"
+        f"<div class='status-strip'>"
+        f"📅 {current_ist.strftime('%d %b %Y (%a)')}  |  Cash: <b style='color:#f8fafc;'>₹{cash:,.2f}</b>  |  "
+        f"Unrealized P&L: <b style='color:{'#34d399' if unrealized_pnl_total >= 0 else '#f87171'};'>₹{unrealized_pnl_total:+,.2f}</b>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -227,20 +242,14 @@ ag3_msgs = get_agent_msgs("AG3_HIGH_RISK", 3)
 ag4_msgs = get_agent_msgs("AG4_CHIEF_ANALYST", 3)
 ag5_msgs = get_agent_msgs("AG5_EXECUTION_BROKER", 3)
 
-# ==============================================================================
-# INTERACTIVE MULTI-PAGE TABS
-# ==============================================================================
 tab_dash, tab_charts, tab_port, tab_agents, tab_logs = st.tabs([
     "🏠 Command Center",
-    "📈 Live Stock Charts",
-    "💼 Portfolio & Live P&L",
-    "🤖 Agent Intelligence",
-    "📜 Trade & Audit Ledger",
+    "📈 Live Charts",
+    "💼 Portfolio & P&L",
+    "🤖 Agents",
+    "📜 Ledger",
 ])
 
-# ------------------------------------------------------------------------------
-# TAB 1: COMMAND CENTER
-# ------------------------------------------------------------------------------
 with tab_dash:
     top_left, top_right = st.columns([3.3, 1.3])
     with top_left:
@@ -249,19 +258,19 @@ with tab_dash:
         with w1:
             st.markdown(f"<div class='wf-card wf-green'><div style='font-size:22px;'>🛡️</div><div class='wf-title'>AG1</div><div class='wf-sub'>Low Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag1_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
         with a1:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#64748b;'>→</div>", unsafe_allow_html=True)
+            st.markdown("<div class='wf-arrow'>→</div>", unsafe_allow_html=True)
         with w2:
             st.markdown(f"<div class='wf-card wf-blue'><div style='font-size:22px;'>📈</div><div class='wf-title'>AG2</div><div class='wf-sub'>Mid Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag2_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
         with a2:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#64748b;'>→</div>", unsafe_allow_html=True)
+            st.markdown("<div class='wf-arrow'>→</div>", unsafe_allow_html=True)
         with w3:
             st.markdown(f"<div class='wf-card wf-orange'><div style='font-size:22px;'>🚀</div><div class='wf-title'>AG3</div><div class='wf-sub'>High Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag3_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
         with a3:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#a855f7;'>⇉</div>", unsafe_allow_html=True)
+            st.markdown("<div class='wf-arrow' style='color:#a855f7;'>⇉</div>", unsafe_allow_html=True)
         with w4:
             st.markdown(f"<div class='wf-card wf-purple'><div style='font-size:22px;'>🧠</div><div class='wf-title'>AG4</div><div class='wf-sub'>Final Analysis & Selection</div><div class='wf-stat'>✓ {'Verified' if ag4_msgs else 'Waiting'}</div></div>", unsafe_allow_html=True)
         with a4:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#06b6d4;'>→</div>", unsafe_allow_html=True)
+            st.markdown("<div class='wf-arrow' style='color:#06b6d4;'>→</div>", unsafe_allow_html=True)
         with w5:
             st.markdown(f"<div class='wf-card wf-teal'><div style='font-size:22px;'>🛒</div><div class='wf-title'>AG5</div><div class='wf-sub'>Execute Trades</div><div class='wf-stat'>✓ {len(open_t)} Open</div></div>", unsafe_allow_html=True)
 
@@ -372,9 +381,6 @@ with tab_dash:
             display_df.columns = ["Time (IST)", "Stock", "Tier", "Qty", "Entry (₹)", "Status", "Realized P&L"]
             st.dataframe(display_df, use_container_width=True, hide_index=True, height=250)
 
-# ------------------------------------------------------------------------------
-# TAB 2: LIVE INTERACTIVE STOCK CHARTS (PORTFOLIO & WATCHLIST)
-# ------------------------------------------------------------------------------
 with tab_charts:
     st.markdown("#### 📈 Interactive Live NSE Stock Chart & Bracket Levels")
     portfolio_syms = open_t["symbol"].tolist() if not open_t.empty else []
@@ -383,7 +389,7 @@ with tab_charts:
 
     ch1, ch2, ch3 = st.columns([2, 1.5, 1.5])
     with ch1:
-        selected_label = st.selectbox("Select Stock (Portfolio holdings listed first)", selectable_stocks)
+        selected_label = st.selectbox("Select Stock (Portfolio holdings first)", selectable_stocks)
         chart_sym = "^NSEI" if "NIFTY 50" in selected_label else selected_label
     with ch2:
         tf_choice = st.selectbox("Timeframe & Candle Interval", [
@@ -447,23 +453,20 @@ with tab_charts:
 
         if holding_row is not None:
             fig.add_hline(y=float(holding_row["entry"]), line_dash="dash", line_color="#38bdf8", annotation_text=f"Entry ₹{holding_row['entry']:,.2f}")
-            fig.add_hline(y=float(holding_row["sl"]), line_dash="dot", line_color="#f87171", annotation_text=f"Stop-Loss ₹{holding_row['sl']:,.2f}")
+            fig.add_hline(y=float(holding_row["sl"]), line_dash="dot", line_color="#f87171", annotation_text=f"SL ₹{holding_row['sl']:,.2f}")
             fig.add_hline(y=float(holding_row["target"]), line_dash="dash", line_color="#34d399", annotation_text=f"Target ₹{holding_row['target']:,.2f}")
 
         fig.update_layout(
             template="plotly_dark",
             paper_bgcolor="#0b1324",
             plot_bgcolor="#081020",
-            height=480,
-            margin=dict(l=10, r=10, t=30, b=10),
+            height=420,
+            margin=dict(l=8, r=8, t=28, b=8),
             xaxis_rangeslider_visible=False,
             yaxis_title="Price (₹ INR)",
         )
         st.plotly_chart(fig, use_container_width=True)
 
-# ------------------------------------------------------------------------------
-# TAB 3: PORTFOLIO & LIVE MARK-TO-MARKET P&L (WITH MANUAL SELL OPTION)
-# ------------------------------------------------------------------------------
 with tab_port:
     st.markdown("#### 💼 Active Virtual NSE Holdings & Live Mark-to-Market P&L")
     p1, p2, p3, p4 = st.columns(4)
@@ -514,12 +517,9 @@ with tab_port:
                 st.toast(f"Closed {sym_to_close}!", icon="✅")
                 st.rerun()
 
-# ------------------------------------------------------------------------------
-# TAB 4: AGENT INTELLIGENCE INSPECTOR
-# ------------------------------------------------------------------------------
 with tab_agents:
     st.markdown("#### 🤖 Individual Agent Decision Inspector & JSON Payloads")
-    a_tabs = st.tabs(["🛡️ AG1 (Low Risk)", "📈 AG2 (Mid Risk)", "🚀 AG3 (High Risk)", "🧠 AG4 (Chief Analyst)", "⚡ AG5 (Executor)"])
+    a_tabs = st.tabs(["🛡️ AG1 (Low)", "📈 AG2 (Mid)", "🚀 AG3 (High)", "🧠 AG4 (Chief)", "⚡ AG5 (Broker)"])
     codes = ["AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK", "AG4_CHIEF_ANALYST", "AG5_EXECUTION_BROKER"]
     for t_obj, code in zip(a_tabs, codes):
         with t_obj:
@@ -532,9 +532,6 @@ with tab_agents:
                     with st.expander("Inspect Structured Reasoning JSON"):
                         st.code(r["payload_json"], language="json")
 
-# ------------------------------------------------------------------------------
-# TAB 5: FULL TRADE & COMMUNICATION AUDIT LEDGER
-# ------------------------------------------------------------------------------
 with tab_logs:
     l1, l2 = st.columns(2)
     with l1:
@@ -547,7 +544,6 @@ with tab_logs:
                 st.markdown(f"**`{r['timestamp']}`** — **{r['sender']}** ➡️ **{r['recipient']}**")
                 st.write(r["summary"])
 
-# --- OPTIONAL 60-SECOND LIVE AUTO-REFRESH ---
 if auto_refresh:
     import time
     time.sleep(60)
