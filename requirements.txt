@@ -4,3 +4,5 @@ pandas
 pydantic
 google-genai
 feedparser
+gspread
+google-auth
