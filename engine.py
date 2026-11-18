@@ -1,20 +1,20 @@
 import os
 import json
 import asyncio
-import sqlite3
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 import yfinance as yf
 import feedparser
+import gspread
+from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from schemas import StockSignal, CommitteeOutput, FinalDecision
 
-IST = ZoneInfo("Asia/Kolkata")
-DB_PATH = "nse_demo_trades.db"
+IST = timezone(timedelta(hours=5, minutes=30))
 CANDIDATE_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+SHEET_NAME = "NSE_5Agent_Ledger"
 
 NSE_WATCHLIST = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
@@ -27,54 +27,30 @@ RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
 
 
 def now_ist() -> datetime:
-    return datetime.now(IST)
+    return datetime.now(timezone.utc).astimezone(IST)
 
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    return conn
+def get_gsheet_client(gcp_creds_dict: dict):
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(gcp_creds_dict, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open(SHEET_NAME)
 
 
-def init_db(initial_capital: float = 1_000_000.0):
-    with get_conn() as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, cash REAL)")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, symbol TEXT, tier TEXT, status TEXT,
-                qty INTEGER, entry REAL, sl REAL, target REAL, exit_price REAL, pnl REAL, reason TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS agent_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id TEXT, timestamp TEXT, sender TEXT, recipient TEXT,
-                msg_type TEXT, summary TEXT, payload_json TEXT
-            )
-        """)
-        if conn.execute("SELECT COUNT(*) FROM account").fetchone()[0] == 0:
-            conn.execute("INSERT INTO account (id, cash) VALUES (1, ?)", (initial_capital,))
-        conn.commit()
-
-
-def log_msg(cycle_id: str, sender: str, recipient: str, msg_type: str, summary: str, payload):
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO agent_messages (cycle_id, timestamp, sender, recipient, msg_type, summary, payload_json)
-               VALUES (?,?,?,?,?,?,?)""",
-            (
-                cycle_id,
-                now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-                sender,
-                recipient,
-                msg_type,
-                summary,
-                json.dumps(payload, indent=2),
-            ),
-        )
-        conn.commit()
+def log_msg(sh, cycle_id: str, sender: str, recipient: str, msg_type: str, summary: str, payload):
+    ws = sh.worksheet("agent_messages")
+    ws.append_row([
+        cycle_id,
+        now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+        sender,
+        recipient,
+        msg_type,
+        summary,
+        json.dumps(payload),
+    ])
 
 
 def fetch_nse_metrics() -> list[dict]:
@@ -178,9 +154,9 @@ def quant_fallback_screener(agent_id: str, data_slice: list[dict]) -> list[Stock
     return signals
 
 
-async def run_screener(client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict]) -> list[StockSignal]:
+async def run_screener(sh, client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict]) -> list[StockSignal]:
     if not data_slice:
-        log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched this cycle.", [])
+        log_msg(sh, cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched.", [])
         return []
 
     prompt = (
@@ -202,11 +178,11 @@ async def run_screener(client, cycle_id: str, agent_id: str, rules: str, data_sl
         if signals
         else "No setups approved."
     )
-    log_msg(cycle_id, agent_id, "AG4_CHIEF_ANALYST", "CANDIDATE_PROPOSAL", summary, [s.model_dump() for s in signals])
+    log_msg(sh, cycle_id, agent_id, "AG4_CHIEF_ANALYST", "CANDIDATE_PROPOSAL", summary, [s.model_dump() for s in signals])
     return signals
 
 
-async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> CommitteeOutput:
+async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal]) -> CommitteeOutput:
     enriched = [{"signal": c.model_dump(), "news": fetch_nse_news(c.symbol)} for c in candidates]
     prompt = (
         "You are AG4, Chief Analyst for NSE India. Audit all candidates from AG1 (Low), AG2 (Mid), and AG3 (High) "
@@ -242,6 +218,7 @@ async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> Commi
 
     buys = [d for d in decision.selected_trades if d.action == "BUY"]
     log_msg(
+        sh,
         cycle_id,
         "AG4_CHIEF_ANALYST",
         "AG5_EXECUTION_BROKER",
@@ -252,68 +229,57 @@ async def run_ag4(client, cycle_id: str, candidates: list[StockSignal]) -> Commi
     return decision
 
 
-def ag5_broker_step(cycle_id: str, decisions: list[FinalDecision], live_prices: dict[str, float]):
-    pending_logs = []
+def ag5_broker_step(sh, cycle_id: str, decisions: list[FinalDecision], live_prices: dict[str, float]):
+    acct_ws = sh.worksheet("account")
+    trades_ws = sh.worksheet("trades")
+    cash = float(acct_ws.acell("A2").value or 1_000_000.0)
+    records = trades_ws.get_all_records()
 
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cash = cur.execute("SELECT cash FROM account WHERE id=1").fetchone()[0]
-
-        for tid, sym, qty, entry, sl, target in cur.execute(
-            "SELECT id, symbol, qty, entry, sl, target FROM trades WHERE status='OPEN'"
-        ).fetchall():
+    # 1. Monitor open positions for SL/TP exits
+    open_symbols = set()
+    for idx, row in enumerate(records, start=2):
+        if row.get("status") == "OPEN":
+            sym = row["symbol"]
+            open_symbols.add(sym)
             ltp = live_prices.get(sym)
+            sl, target, entry, qty = float(row["sl"]), float(row["target"]), float(row["entry"]), int(row["qty"])
             if ltp and (ltp <= sl or ltp >= target):
                 outcome = "TARGET_HIT" if ltp >= target else "SL_HIT"
                 pnl = round((ltp - entry) * qty, 2)
                 cash += ltp * qty
-                cur.execute("UPDATE account SET cash=?", (cash,))
-                cur.execute("UPDATE trades SET status=?, exit_price=?, pnl=? WHERE id=?", (outcome, ltp, pnl, tid))
-                pending_logs.append((
-                    outcome,
-                    f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}",
-                    {"symbol": sym, "pnl": pnl},
-                ))
-
-        for d in decisions:
-            if d.action != "BUY" or d.conviction < 65:
-                continue
-            if cur.execute("SELECT id FROM trades WHERE symbol=? AND status='OPEN'", (d.symbol,)).fetchone():
-                continue
-            risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
-            qty = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
-            cost = qty * d.entry_price
-            if qty > 0 and cost <= cash * 0.25:
-                cash -= cost
-                cur.execute("UPDATE account SET cash=?", (cash,))
-                cur.execute(
-                    """INSERT INTO trades (timestamp, symbol, tier, status, qty, entry, sl, target, reason)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (
-                        now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-                        d.symbol,
-                        d.risk_tier,
-                        "OPEN",
-                        qty,
-                        d.entry_price,
-                        d.stop_loss,
-                        d.target_price,
-                        d.reasoning,
-                    ),
+                trades_ws.update(f"D{idx}", [[outcome]])
+                trades_ws.update(f"I{idx}:J{idx}", [[ltp, pnl]])
+                open_symbols.discard(sym)
+                log_msg(
+                    sh, cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", outcome,
+                    f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}", {"symbol": sym, "pnl": pnl}
                 )
-                pending_logs.append((
-                    "PAPER_BUY",
-                    f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
-                    d.model_dump(),
-                ))
 
-        conn.commit()
+    # 2. Execute new virtual BUY orders
+    for d in decisions:
+        if d.action != "BUY" or d.conviction < 65 or d.symbol in open_symbols:
+            continue
+        risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
+        qty = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
+        cost = qty * d.entry_price
+        if qty > 0 and cost <= cash * 0.25:
+            cash -= cost
+            open_symbols.add(d.symbol)
+            trades_ws.append_row([
+                now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+                d.symbol, d.risk_tier, "OPEN", qty, d.entry_price, d.stop_loss, d.target_price, "", 0, d.reasoning
+            ])
+            log_msg(
+                sh, cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "PAPER_BUY",
+                f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
+                d.model_dump()
+            )
 
-    for msg_type, summary, payload in pending_logs:
-        log_msg(cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", msg_type, summary, payload)
+    acct_ws.update("A2", [[round(cash, 2)]])
 
 
-async def run_full_cycle(api_key: str):
+async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
+    sh = get_gsheet_client(gcp_creds_dict)
     client = genai.Client(api_key=api_key.strip())
     cycle_id = now_ist().strftime("CYC-%H%M%S-IST")
     market_data = fetch_nse_metrics()
@@ -324,21 +290,21 @@ async def run_full_cycle(api_key: str):
     ag3_slice = [d for d in market_data if d["beta"] >= 1.15 or abs(d["day_change_pct"]) >= 1.2] or market_data
 
     ag1 = await run_screener(
-        client, cycle_id, "AG1_LOW_RISK",
+        sh, client, cycle_id, "AG1_LOW_RISK",
         "Focus on LOW-RISK large-cap stability (lowest beta, price near/above 200-SMA, tight 1.5x ATR stop).",
         ag1_slice,
     )
     ag2 = await run_screener(
-        client, cycle_id, "AG2_MID_RISK",
+        sh, client, cycle_id, "AG2_MID_RISK",
         "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
         ag2_slice,
     )
     ag3 = await run_screener(
-        client, cycle_id, "AG3_HIGH_RISK",
+        sh, client, cycle_id, "AG3_HIGH_RISK",
         "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move, tight 1x ATR stop).",
         ag3_slice,
     )
 
     candidates = ag1 + ag2 + ag3
-    decisions = (await run_ag4(client, cycle_id, candidates)).selected_trades if candidates else []
-    ag5_broker_step(cycle_id, decisions, live_prices)
+    decisions = (await run_ag4(sh, client, cycle_id, candidates)).selected_trades if candidates else []
+    ag5_broker_step(sh, cycle_id, decisions, live_prices)
