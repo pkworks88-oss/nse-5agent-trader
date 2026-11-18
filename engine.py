@@ -1,558 +1,441 @@
-import streamlit as st
-import asyncio
 import os
+import io
 import json
+import asyncio
+import urllib.request
+import http.cookiejar
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 import pandas as pd
 import yfinance as yf
-import plotly.graph_objects as go
-from engine import run_full_cycle, get_gsheet_client, now_ist
+import feedparser
+import gspread
+from google.oauth2.service_account import Credentials
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from schemas import StockSignal, CommitteeOutput, FinalDecision
 
 IST = timezone(timedelta(hours=5, minutes=30))
+CANDIDATE_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+SHEET_NAME = "NSE_5Agent_Ledger"
+
+FALLBACK_NSE_250 = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "BHARTIARTL.NS", "ICICIBANK.NS", "INFY.NS", "SBIN.NS",
+    "HINDUNILVR.NS", "ITC.NS", "LT.NS", "HCLTECH.NS", "BAJFINANCE.NS", "SUNPHARMA.NS", "MARUTI.NS",
+    "AXISBANK.NS", "KOTAKBANK.NS", "TITAN.NS", "ONGC.NS", "TATAMOTORS.NS", "ADANIENT.NS", "NTPC.NS",
+    "ULTRACEMCO.NS", "M&M.NS", "POWERGRID.NS", "WIPRO.NS", "COALINDIA.NS", "BAJAJFINSV.NS", "JSWSTEEL.NS",
+    "TATASTEEL.NS", "ADANIPORTS.NS", "ASIANPAINT.NS", "DMART.NS", "HAL.NS", "BEL.NS", "TRENT.NS",
+    "SIEMENS.NS", "VBL.NS", "NESTLEIND.NS", "GRASIM.NS", "TECHM.NS", "INDIGO.NS", "DLF.NS", "HINDALCO.NS",
+    "DIVISLAB.NS", "PIDILITIND.NS", "LTIM.NS", "SBILIFE.NS", "HDFCLIFE.NS", "BAJAJ-AUTO.NS", "BRITANNIA.NS",
+    "EICHERMOT.NS", "CIPLA.NS", "DRREDDY.NS", "APOLLOHOSP.NS", "TATACONSUM.NS", "HEROMOTOCO.NS", "BPCL.NS",
+    "IOC.NS", "GAIL.NS", "INDUSINDBK.NS", "GODREJCP.NS", "BANKBARODA.NS", "PNB.NS", "CANBK.NS",
+    "UNIONBANK.NS", "CHOLAFIN.NS", "SHRIRAMFIN.NS", "MUTHOOTFIN.NS", "RECLTD.NS", "PFC.NS", "IRFC.NS",
+    "RVNL.NS", "MAZDOCK.NS", "COCHINSHIP.NS", "BDL.NS", "BHEL.NS", "SAIL.NS", "NMDC.NS", "VEDL.NS",
+    "HINDZINC.NS", "NATIONALUM.NS", "JINDALSTEL.NS", "APLAPOLLO.NS", "POLYCAB.NS", "KEI.NS", "HAVELLS.NS",
+    "VOLTAS.NS", "BLUESTARCO.NS", "DIXON.NS", "KAYNES.NS", "AMBER.NS", "CROMPTON.NS", "ABB.NS",
+    "CUMMINSIND.NS", "THERMAX.NS", "CGPOWER.NS", "SUZLON.NS", "TATAPOWER.NS", "JSWENERGY.NS", "NHPC.NS",
+    "SJVN.NS", "ADANIPOWER.NS", "ADANIGREEN.NS", "ADANIENSOL.NS", "ATGL.NS", "TORNTPOWER.NS", "CESC.NS",
+    "PERSISTENT.NS", "COFORGE.NS", "MPHASIS.NS", "KPITTECH.NS", "TATAELXSI.NS", "LTTS.NS", "OFSS.NS",
+    "NAUKRI.NS", "POLICYBZR.NS", "PAYTM.NS", "DELHIVERY.NS", "IRCTC.NS", "CONCOR.NS", "GMRINFRA.NS",
+    "OBEROIRLTY.NS", "GODREJPROP.NS", "PRESTIGE.NS", "PHOENIXLTD.NS", "LODHA.NS", "BRIGADE.NS",
+    "SOBHA.NS", "LUPIN.NS", "AUROPHARMA.NS", "ALKEM.NS", "TORNTPHARM.NS", "BIOCON.NS", "GLENMARK.NS",
+    "LAURUSLABS.NS", "IPCALAB.NS", "ZYDUSLIFE.NS", "MAXHEALTH.NS", "FORTIS.NS", "SYNGENE.NS",
+    "TVSMOTOR.NS", "ASHOKLEY.NS", "BHARATFORG.NS", "MOTHERSON.NS", "SONACOMS.NS", "BALKRISIND.NS",
+    "MRF.NS", "APOLLOTYRE.NS", "EXIDEIND.NS", "AMARAJABAT.NS", "ESCORTS.NS", "BOSCHLTD.NS",
+    "MARICO.NS", "DABUR.NS", "COLPAL.NS", "UBL.NS", "UNITDSPR.NS", "RADICO.NS", "JUBLFOOD.NS",
+    "DEVYANI.NS", "KALYANKJIL.NS", "TITAGARH.NS", "TEXRAIL.NS", "JWL.NS", "KPIL.NS", "KEC.NS",
+    "NCC.NS", "NBCC.NS", "HUDCO.NS", "IRCON.NS", "RITES.NS", "ENGINERSIN.NS", "GSPL.NS", "PETRONET.NS",
+    "IGL.NS", "MGL.NS", "GUJGASLTD.NS", "DEEPAKNTR.NS", "SRF.NS", "PIIND.NS", "UPL.NS", "ATUL.NS",
+    "NAVINFLUOR.NS", "AARTIIND.NS", "TATACHEM.NS", "CHAMBLFERT.NS", "COROMANDEL.NS", "ASTRAL.NS",
+    "SUPREMEIND.NS", "FINPIPE.NS", "KAJARIACER.NS", "CENTURYPLY.NS", "PAGEIND.NS", "ABFRL.NS",
+    "MANYAVAR.NS", "BATAINDIA.NS", "RELAXO.NS", "INDHOTEL.NS", "EIHOTEL.NS", "LEMONTREE.NS",
+    "FEDERALBNK.NS", "IDFCFIRSTB.NS", "AUBANK.NS", "BANDHANBNK.NS", "RBLBANK.NS", "KARURVYSYA.NS",
+    "CUB.NS", "ABCAPITAL.NS", "LTF.NS", "MANAPPURAM.NS", "POONAWALLA.NS", "IIFL.NS", "360ONE.NS",
+    "ANGELONE.NS", "CDSL.NS", "BSE.NS", "MCX.NS", "CAMS.NS", "KFINTECH.NS", "NUVAMA.NS",
+    "SBICARD.NS", "ICICIGI.NS", "ICICIPRULI.NS", "STARHEALTH.NS", "GICRE.NS", "NIACL.NS",
+    "ACC.NS", "AMBUJACEM.NS", "SHREECEM.NS", "DALBHARAT.NS", "JKCEMENT.NS", "RAMCOCEM.NS",
+    "SUNDRMFAST.NS", "ENDURANCE.NS", "UNOMINDA.NS", "SCHAEFFLER.NS", "TIMKEN.NS", "SKFINDIA.NS"
+]
+
+RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
 
 
-def get_ist_now() -> datetime:
+def now_ist() -> datetime:
     return datetime.now(timezone.utc).astimezone(IST)
 
 
-st.set_page_config(
-    page_title="5-Agent Intelligent Stock Trading Platform",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+def get_gsheet_client(gcp_creds_dict: dict):
+    creds_copy = dict(gcp_creds_dict)
+    if "private_key" in creds_copy:
+        creds_copy["private_key"] = creds_copy["private_key"].replace("\\n", "\n")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_copy, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open(SHEET_NAME)
 
-# --- CYBER-TERMINAL STYLING ---
-st.markdown("""
-<style>
-    .stApp { background: radial-gradient(circle at top right, #0f1c36 0%, #070d19 60%, #050912 100%); color: #e2e8f0; }
-    section[data-testid="stSidebar"] { background-color: #081020; border-right: 1px solid #1e293b; }
-    .top-bar { display: flex; justify-content: space-between; align-items: center; background: linear-gradient(90deg, #0d172a 0%, #111f38 100%); border: 1px solid #1e3a5f; border-radius: 12px; padding: 12px 20px; margin-bottom: 12px; }
-    .platform-title { font-size: 21px; font-weight: 800; color: #f8fafc; margin: 0; }
-    .live-pill { background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; color: #34d399; padding: 4px 12px; border-radius: 20px; font-size: 12.5px; font-weight: 600; }
-    .wf-card { border-radius: 12px; padding: 14px 10px; text-align: center; background: #0b1426; min-height: 130px; }
-    .wf-green { border: 1.5px solid #10b981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.22); }
-    .wf-blue  { border: 1.5px solid #3b82f6; box-shadow: 0 0 15px rgba(59, 130, 246, 0.22); }
-    .wf-orange{ border: 1.5px solid #f97316; box-shadow: 0 0 15px rgba(249, 115, 22, 0.22); }
-    .wf-purple{ border: 1.5px solid #a855f7; box-shadow: 0 0 15px rgba(168, 85, 247, 0.22); }
-    .wf-teal  { border: 1.5px solid #06b6d4; box-shadow: 0 0 15px rgba(6, 182, 212, 0.22); }
-    .wf-title { font-size: 17px; font-weight: 800; color: #ffffff; margin: 4px 0; }
-    .wf-sub   { font-size: 11.5px; color: #94a3b8; margin-bottom: 6px; }
-    .wf-stat  { font-size: 12px; font-weight: 600; color: #34d399; }
-    .agent-col { background: #0b1324; border: 1px solid #1e293b; border-radius: 12px; padding: 12px; min-height: 290px; }
-    .chat-bubble { background: #131f38; border-left: 3px solid #38bdf8; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-size: 12.5px; color: #e2e8f0; }
-    .chat-time { font-size: 10.5px; color: #64748b; display: block; margin-bottom: 2px; }
-    .panel-box { background: #0b1324; border: 1px solid #1e293b; border-radius: 12px; padding: 16px; }
-    .rec-ticker { font-size: 24px; font-weight: 800; color: #34d399; letter-spacing: 0.5px; }
-    .metric-big { font-size: 23px; font-weight: 800; color: #f8fafc; }
 
-    /* Interactive Top Navigation Tabs */
-    div[data-testid="stTabs"] button {
-        background-color: #0d172a;
-        border: 1px solid #1e293b;
-        border-radius: 8px 8px 0 0;
-        color: #94a3b8;
-        font-weight: 600;
-        padding: 8px 18px;
+def log_msg(sh, cycle_id: str, sender: str, recipient: str, msg_type: str, summary: str, payload):
+    ws = sh.worksheet("agent_messages")
+    ws.append_row([
+        cycle_id,
+        now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+        sender,
+        recipient,
+        msg_type,
+        summary,
+        json.dumps(payload),
+    ])
+
+
+def fetch_nse_live_movers() -> list[str]:
+    """Pulls live intraday NSE Top Gainers, Top Losers, and Volume Spurts across all 2,200+ NSE stocks."""
+    movers = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/market-data/live-equity-market",
     }
-    div[data-testid="stTabs"] button[aria-selected="true"] {
-        background-color: #132342;
-        border-color: #38bdf8;
-        color: #ffffff;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-
-@st.cache_data(ttl=90)
-def get_indian_indices():
-    indices = {"NIFTY 50": "^NSEI", "SENSEX": "^BSESN", "BANK NIFTY": "^NSEBANK"}
-    out = {}
-    for name, sym in indices.items():
-        try:
-            hist = yf.Ticker(sym).history(period="5d")
-            if len(hist) >= 2:
-                curr, prev = float(hist["Close"].iloc[-1]), float(hist["Close"].iloc[-2])
-                diff = curr - prev
-                out[name] = (curr, diff, (diff / prev) * 100)
-            else:
-                out[name] = (25280.05, 105.20, 0.42)
-        except Exception:
-            out[name] = (25280.05, 105.20, 0.42)
-    return out
-
-
-@st.cache_data(ttl=60)
-def get_live_ltps(symbols: tuple[str, ...]) -> dict[str, float]:
-    prices = {}
-    if not symbols:
-        return prices
     try:
-        data = yf.download(list(symbols), period="2d", interval="15m", group_by="ticker", progress=False, threads=True)
-        for sym in symbols:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener.addheaders = list(headers.items())
+        opener.open("https://www.nseindia.com", timeout=6).read()
+
+        endpoints = [
+            "https://www.nseindia.com/api/live-analysis-variations?index=gainers",
+            "https://www.nseindia.com/api/live-analysis-variations?index=loosers",
+            "https://www.nseindia.com/api/live-analysis-volume-gainers",
+        ]
+        for ep in endpoints:
             try:
-                sub = data[sym]["Close"].dropna() if len(symbols) > 1 else data["Close"].dropna()
-                if not sub.empty:
-                    prices[sym] = round(float(sub.iloc[-1]), 2)
+                raw_json = opener.open(ep, timeout=6).read().decode("utf-8")
+                payload = json.loads(raw_json)
+                rows = []
+                if isinstance(payload, dict):
+                    if "allSec" in payload and isinstance(payload["allSec"], dict):
+                        rows = payload["allSec"].get("data", [])
+                    elif "NIFTY" in payload and isinstance(payload["NIFTY"], dict):
+                        rows = payload["NIFTY"].get("data", [])
+                    elif "data" in payload:
+                        rows = payload.get("data", [])
+                for item in rows[:20]:
+                    sym = str(item.get("symbol", "")).strip()
+                    if sym and sym.isalpha():
+                        movers.append(f"{sym}.NS")
             except Exception:
                 continue
     except Exception:
         pass
-    return prices
+    return list(dict.fromkeys(movers))
 
 
-@st.cache_data(ttl=60)
-def get_stock_chart_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+def get_dynamic_250_universe() -> tuple[list[str], int]:
+    """Combines live NSE Top Gainers/Losers/Volume Spurts + NIFTY 200 index constituents (~250 unique stocks)."""
+    live_movers = fetch_nse_live_movers()
+
+    nifty200_symbols = []
     try:
-        df = yf.Ticker(symbol).history(period=period, interval=interval)
-        return df.dropna()
+        url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            csv_text = resp.read().decode("utf-8")
+        df_idx = pd.read_csv(io.StringIO(csv_text))
+        if "Symbol" in df_idx.columns:
+            nifty200_symbols = [f"{str(s).strip()}.NS" for s in df_idx["Symbol"].dropna().tolist()]
     except Exception:
-        return pd.DataFrame()
+        nifty200_symbols = FALLBACK_NSE_250[:200]
+
+    combined = list(dict.fromkeys(live_movers + nifty200_symbols + FALLBACK_NSE_250))
+    return combined[:250], len(live_movers)
 
 
-def is_nse_market_open(now_dt: datetime) -> bool:
-    if now_dt.weekday() >= 5:
-        return False
-    mins = now_dt.hour * 60 + now_dt.minute
-    return (9 * 60 + 15) <= mins <= (15 * 60 + 30)
+def fetch_nse_metrics(excluded_symbols: set[str] | None = None) -> tuple[list[dict], dict[str, float], int]:
+    """Scans ~250 dynamic NSE stocks in a single batch call and returns filtered candidates + live prices."""
+    excluded = excluded_symbols or set()
+    universe, live_mover_count = get_dynamic_250_universe()
+    snapshots = []
+    live_prices = {}
+
+    try:
+        data = yf.download(universe, period="6mo", interval="1d", group_by="ticker", progress=False, threads=True)
+    except Exception:
+        return snapshots, live_prices, live_mover_count
+
+    for sym in universe:
+        try:
+            if sym not in data.columns.get_level_values(0):
+                continue
+            hist = data[sym].dropna(subset=["Close"])
+            if len(hist) < 35:
+                continue
+
+            close, volume = hist["Close"], hist["Volume"]
+            ltp = float(close.iloc[-1])
+            avg_vol = float(volume.rolling(20).mean().iloc[-1])
+
+            if ltp > 0:
+                live_prices[sym] = round(ltp, 2)
+
+            if sym in excluded or ltp < 50.0 or avg_vol < 100_000:
+                continue
+
+            sma_50 = float(close.rolling(min(50, len(hist))).mean().iloc[-1])
+            sma_200 = float(close.rolling(min(200, len(hist))).mean().iloc[-1])
+
+            delta = close.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss.replace(0, float("nan"))
+            rsi_val = (100 - (100 / (1 + rs))).iloc[-1]
+            rsi = float(rsi_val) if rsi_val == rsi_val else 50.0
+
+            atr = float((hist["High"] - hist["Low"]).rolling(14).mean().iloc[-1])
+            rvol = float(volume.iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
+
+            atr_pct = (atr / ltp) * 100
+            beta_proxy = round(max(0.6, min(2.2, atr_pct / 1.8)), 2)
+            prev_close = float(close.iloc[-2])
+            day_change_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+
+            snapshots.append({
+                "symbol": sym,
+                "ltp": round(ltp, 2),
+                "sma_50": round(sma_50, 2),
+                "sma_200": round(sma_200, 2),
+                "rsi_14": round(rsi, 2),
+                "atr_14": round(atr, 2),
+                "rvol": round(rvol, 2),
+                "beta": beta_proxy,
+                "day_change_pct": day_change_pct,
+            })
+        except Exception:
+            continue
+
+    return snapshots, live_prices, live_mover_count
 
 
-current_ist = get_ist_now()
-market_open = is_nse_market_open(current_ist)
-
-api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
-if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
-    raw_gcp = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
-    gcp_creds = json.loads(raw_gcp) if isinstance(raw_gcp, str) else dict(raw_gcp)
-elif "gcp_service_account" in st.secrets:
-    gcp_creds = dict(st.secrets["gcp_service_account"])
-else:
-    st.error("Missing `GCP_SERVICE_ACCOUNT_JSON` in Streamlit Secrets.")
-    st.stop()
-
-# --- LOAD LIVE CLOUD STATE FROM GOOGLE SHEETS ---
-sh = get_gsheet_client(gcp_creds)
-cash = float(sh.worksheet("account").acell("A2").value or 1_000_000.0)
-trades_records = sh.worksheet("trades").get_all_records()
-msgs_records = sh.worksheet("agent_messages").get_all_records()
-
-trades_df = pd.DataFrame(trades_records).iloc[::-1] if trades_records else pd.DataFrame()
-msgs_df = pd.DataFrame(msgs_records).iloc[::-1].head(120) if msgs_records else pd.DataFrame()
-
-open_t = trades_df[trades_df["status"] == "OPEN"].copy() if not trades_df.empty else pd.DataFrame()
-closed_t = trades_df[trades_df["status"] != "OPEN"].copy() if not trades_df.empty else pd.DataFrame()
-
-# Fetch live intraday LTPs for all open positions
-open_symbols_tuple = tuple(sorted(open_t["symbol"].unique().tolist())) if not open_t.empty else ()
-live_ltp_map = get_live_ltps(open_symbols_tuple)
-
-if not open_t.empty:
-    open_t["qty"] = open_t["qty"].astype(float)
-    open_t["entry"] = open_t["entry"].astype(float)
-    open_t["sl"] = open_t["sl"].astype(float)
-    open_t["target"] = open_t["target"].astype(float)
-    open_t["live_ltp"] = open_t["symbol"].map(live_ltp_map).fillna(open_t["entry"])
-    open_t["unrealized_pnl"] = ((open_t["live_ltp"] - open_t["entry"]) * open_t["qty"]).round(2)
-    open_t["pnl_pct"] = (((open_t["live_ltp"] - open_t["entry"]) / open_t["entry"]) * 100).round(2)
-    invested_cost = (open_t["qty"] * open_t["entry"]).sum()
-    current_holdings_val = (open_t["qty"] * open_t["live_ltp"]).sum()
-    unrealized_pnl_total = open_t["unrealized_pnl"].sum()
-else:
-    invested_cost = 0.0
-    current_holdings_val = 0.0
-    unrealized_pnl_total = 0.0
-
-realized_pnl = closed_t["pnl"].astype(float).sum() if not closed_t.empty else 0.0
-total_portfolio = cash + current_holdings_val
-overall_ret_pct = ((total_portfolio - 1_000_000.0) / 1_000_000.0) * 100
-
-indices = get_indian_indices()
-nifty_val, _, nifty_pct = indices["NIFTY 50"]
-sensex_val, _, sensex_pct = indices["SENSEX"]
-bnifty_val, _, bnifty_pct = indices["BANK NIFTY"]
-
-market_badge_text = (
-    f"● NSE Open • {current_ist.strftime('%I:%M:%S %p IST')}"
-    if market_open
-    else f"● NSE Closed • {current_ist.strftime('%I:%M:%S %p IST')}"
-)
-
-# --- TOP COMMAND BAR & ACTION CONTROLS ---
-st.markdown(f"""
-<div class="top-bar">
-    <div>
-        <span class="platform-title">5-Agent Intelligent Stock Trading Platform</span>
-        <span style="margin-left:14px;color:#94a3b8;font-size:13px;">
-            <b>NIFTY 50</b> {nifty_val:,.2f} <span style="color:#34d399;">({nifty_pct:+.2f}%)</span>  | 
-            <b>SENSEX</b> {sensex_val:,.2f} <span style="color:#34d399;">({sensex_pct:+.2f}%)</span>  | 
-            <b>Equity:</b> <span style="color:#f8fafc;">₹{total_portfolio:,.2f}</span>
-        </span>
-    </div>
-    <div><span class="live-pill">{market_badge_text}</span></div>
-</div>
-""", unsafe_allow_html=True)
-
-ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.4, 1.1, 1.3, 2.2])
-with ctrl1:
-    if st.button("⚡ Run 5-Agent Cycle Now", use_container_width=True, type="primary"):
-        with st.spinner("Scanning 250 NSE stocks + live movers → AG1–AG5 executing..."):
-            asyncio.run(run_full_cycle(api_key, gcp_creds))
-        st.cache_data.clear()
-        st.toast("250-Stock Cycle Completed!", icon="✅")
-        st.rerun()
-with ctrl2:
-    if st.button("🔄 Refresh Prices", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-with ctrl3:
-    auto_refresh = st.toggle("⏱️ Auto-Refresh (60s)", value=False)
-with ctrl4:
-    st.markdown(
-        f"<div style='text-align:right;padding-top:6px;color:#94a3b8;font-size:12.5px;'>"
-        f"📅 {current_ist.strftime('%d %b %Y (%A)')}  |  Cash: <b style='color:#f8fafc;'>₹{cash:,.2f}</b>  |  "
-        f"Live Unrealized P&L: <b style='color:{'#34d399' if unrealized_pnl_total >= 0 else '#f87171'};'>₹{unrealized_pnl_total:+,.2f}</b>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+def fetch_nse_news(symbol: str) -> list[str]:
+    try:
+        clean_name = symbol.replace(".NS", "")
+        url = f"https://news.google.com/rss/search?q={quote(clean_name + ' NSE stock')}&hl=en-IN&gl=IN&ceid=IN:en"
+        feed = feedparser.parse(url)
+        return [entry.title for entry in feed.entries[:3]]
+    except Exception:
+        return ["No breaking news headlines"]
 
 
-def get_agent_msgs(sender_code: str, limit: int = 3):
-    if msgs_df.empty:
+async def generate_fast(client, prompt: str, schema, temperature: float = 0.2):
+    last_error = None
+    for model_name in CANDIDATE_MODELS:
+        try:
+            coro = client.aio.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                    temperature=temperature,
+                ),
+            )
+            resp = await asyncio.wait_for(coro, timeout=14.0)
+            return json.loads(resp.text)
+        except (APIError, asyncio.TimeoutError) as e:
+            last_error = e
+            await asyncio.sleep(0.8)
+            continue
+    raise last_error
+
+
+def quant_fallback_screener(agent_id: str, data_slice: list[dict]) -> list[StockSignal]:
+    sorted_data = sorted(data_slice, key=lambda x: x["rvol"], reverse=True)[:2]
+    signals = []
+    for d in sorted_data:
+        atr = max(d["atr_14"], d["ltp"] * 0.01)
+        signals.append(
+            StockSignal(
+                agent_id=agent_id,
+                symbol=d["symbol"],
+                ltp=d["ltp"],
+                entry_price=d["ltp"],
+                stop_loss=round(d["ltp"] - 1.5 * atr, 2),
+                target_price=round(d["ltp"] + 3.0 * atr, 2),
+                rsi_14=d["rsi_14"],
+                rvol=d["rvol"],
+                beta=d["beta"],
+                setup_reason=f"Quant funnel: RVOL {d['rvol']}x, RSI {d['rsi_14']}, ATR 1:2 R:R setup.",
+            )
+        )
+    return signals
+
+
+async def run_screener(sh, client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict], scanned_count: int, mover_count: int) -> list[StockSignal]:
+    if not data_slice:
+        log_msg(sh, cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched.", [])
         return []
-    return msgs_df[msgs_df["sender"] == sender_code].head(limit).to_dict("records")
+
+    prompt = (
+        f"You are {agent_id} for NSE India (scanning {scanned_count} live NSE stocks including {mover_count} live intraday movers). {rules} "
+        f"From these top-ranked quantitative candidates, pick the 2 best distinct stocks matching your risk tier "
+        f"with realistic INR entry_price, stop_loss, and target_price: {json.dumps(data_slice)}"
+    )
+    try:
+        raw = await generate_fast(client, prompt, list[StockSignal], temperature=0.2)
+        signals = [StockSignal(**item) for item in raw]
+        mode_tag = ""
+    except Exception:
+        signals = quant_fallback_screener(agent_id, data_slice)
+        mode_tag = " [Quant Engine]"
+
+    mover_note = f" ({mover_count} live movers)" if mover_count > 0 else ""
+    summary = (
+        f"Scanned {scanned_count} NSE stocks{mover_note} → Sent {len(signals)} to AG4{mode_tag}: "
+        + ", ".join([f"{s.symbol} @ ₹{s.entry_price}" for s in signals])
+        if signals
+        else "No setups approved."
+    )
+    log_msg(sh, cycle_id, agent_id, "AG4_CHIEF_ANALYST", "CANDIDATE_PROPOSAL", summary, [s.model_dump() for s in signals])
+    return signals
 
 
-ag1_msgs = get_agent_msgs("AG1_LOW_RISK", 3)
-ag2_msgs = get_agent_msgs("AG2_MID_RISK", 3)
-ag3_msgs = get_agent_msgs("AG3_HIGH_RISK", 3)
-ag4_msgs = get_agent_msgs("AG4_CHIEF_ANALYST", 3)
-ag5_msgs = get_agent_msgs("AG5_EXECUTION_BROKER", 3)
+async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal]) -> CommitteeOutput:
+    enriched = [{"signal": c.model_dump(), "news": fetch_nse_news(c.symbol)} for c in candidates]
+    prompt = (
+        "You are AG4, Chief Analyst for NSE India. Audit all candidates from AG1 (Low), AG2 (Mid), and AG3 (High) "
+        "with their news headlines. Mark each BUY or SKIP; approve 1-3 top setups with clean news, non-overbought RSI, "
+        f"and R:R >= 1:1.6. Inputs: {json.dumps(enriched)}"
+    )
+    try:
+        raw = await generate_fast(client, prompt, CommitteeOutput, temperature=0.1)
+        decision = CommitteeOutput(**raw)
+    except Exception:
+        tier_map = {"AG1_LOW_RISK": "LOW", "AG2_MID_RISK": "MID", "AG3_HIGH_RISK": "HIGH"}
+        fallback_trades, seen = [], set()
+        for c in candidates:
+            if c.symbol in seen:
+                continue
+            seen.add(c.symbol)
+            rr = (c.target_price - c.entry_price) / max(c.entry_price - c.stop_loss, 0.01)
+            action = "BUY" if rr >= 1.6 and c.rsi_14 < 75 and len(fallback_trades) < 2 else "SKIP"
+            fallback_trades.append(
+                FinalDecision(
+                    symbol=c.symbol,
+                    risk_tier=tier_map[c.agent_id],
+                    action=action,
+                    conviction=76 if action == "BUY" else 50,
+                    entry_price=c.entry_price,
+                    stop_loss=c.stop_loss,
+                    target_price=c.target_price,
+                    news_status="CLEAR",
+                    reasoning=f"Quant audit: R:R = 1:{rr:.2f}, RSI = {c.rsi_14}, RVOL = {c.rvol}x.",
+                )
+            )
+        decision = CommitteeOutput(selected_trades=fallback_trades)
 
-# ==============================================================================
-# INTERACTIVE MULTI-PAGE TABS
-# ==============================================================================
-tab_dash, tab_charts, tab_port, tab_agents, tab_logs = st.tabs([
-    "🏠 Command Center",
-    "📈 Live Stock Charts",
-    "💼 Portfolio & Live P&L",
-    "🤖 Agent Intelligence",
-    "📜 Trade & Audit Ledger",
-])
+    buys = [d for d in decision.selected_trades if d.action == "BUY"]
+    log_msg(
+        sh,
+        cycle_id,
+        "AG4_CHIEF_ANALYST",
+        "AG5_EXECUTION_BROKER",
+        "VERDICT",
+        f"Approved {len(buys)} BUY order(s) out of {len(candidates)} proposals.",
+        decision.model_dump(),
+    )
+    return decision
 
-# ------------------------------------------------------------------------------
-# TAB 1: COMMAND CENTER
-# ------------------------------------------------------------------------------
-with tab_dash:
-    top_left, top_right = st.columns([3.3, 1.3])
-    with top_left:
-        st.markdown("#### ⚡ 5-Agent Workflow & Communication Flow (24/7 Cloud)")
-        w1, a1, w2, a2, w3, a3, w4, a4, w5 = st.columns([1.8, 0.3, 1.8, 0.3, 1.8, 0.3, 2.0, 0.3, 1.8])
-        with w1:
-            st.markdown(f"<div class='wf-card wf-green'><div style='font-size:22px;'>🛡️</div><div class='wf-title'>AG1</div><div class='wf-sub'>Low Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag1_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
-        with a1:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#64748b;'>→</div>", unsafe_allow_html=True)
-        with w2:
-            st.markdown(f"<div class='wf-card wf-blue'><div style='font-size:22px;'>📈</div><div class='wf-title'>AG2</div><div class='wf-sub'>Mid Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag2_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
-        with a2:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#64748b;'>→</div>", unsafe_allow_html=True)
-        with w3:
-            st.markdown(f"<div class='wf-card wf-orange'><div style='font-size:22px;'>🚀</div><div class='wf-title'>AG3</div><div class='wf-sub'>High Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag3_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
-        with a3:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#a855f7;'>⇉</div>", unsafe_allow_html=True)
-        with w4:
-            st.markdown(f"<div class='wf-card wf-purple'><div style='font-size:22px;'>🧠</div><div class='wf-title'>AG4</div><div class='wf-sub'>Final Analysis & Selection</div><div class='wf-stat'>✓ {'Verified' if ag4_msgs else 'Waiting'}</div></div>", unsafe_allow_html=True)
-        with a4:
-            st.markdown("<div style='text-align:center;padding-top:50px;font-size:22px;color:#06b6d4;'>→</div>", unsafe_allow_html=True)
-        with w5:
-            st.markdown(f"<div class='wf-card wf-teal'><div style='font-size:22px;'>🛒</div><div class='wf-title'>AG5</div><div class='wf-sub'>Execute Trades</div><div class='wf-stat'>✓ {len(open_t)} Open</div></div>", unsafe_allow_html=True)
 
-    with top_right:
-        st.markdown("#### 📊 Live Market Snapshot")
-        st.markdown(f"""
-        <div class="panel-box" style="min-height:130px;padding:12px;">
-            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;"><span style="color:#94a3b8;">NIFTY 50</span><span><b>{nifty_val:,.2f}</b> <span style="color:#34d399;">{nifty_pct:+.2f}%</span></span></div>
-            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;"><span style="color:#94a3b8;">SENSEX</span><span><b>{sensex_val:,.2f}</b> <span style="color:#34d399;">{sensex_pct:+.2f}%</span></span></div>
-            <div style="display:flex;justify-content:space-between;font-size:13px;"><span style="color:#94a3b8;">BANK NIFTY</span><span><b>{bnifty_val:,.2f}</b> <span style="color:#34d399;">{bnifty_pct:+.2f}%</span></span></div>
-        </div>
-        """, unsafe_allow_html=True)
+def ag5_broker_step(sh, cycle_id: str, decisions: list[FinalDecision], live_prices: dict[str, float]):
+    acct_ws = sh.worksheet("account")
+    trades_ws = sh.worksheet("trades")
+    cash = float(acct_ws.acell("A2").value or 1_000_000.0)
+    records = trades_ws.get_all_records()
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("#### 💬 Agent Communication — Live Chat Stream (IST)")
-    c_ag1, c_ag2, c_ag3, c_ag4, c_ag5 = st.columns(5)
+    # 1. Monitor open positions for SL/TP exits
+    open_symbols = set()
+    for idx, row in enumerate(records, start=2):
+        if row.get("status") == "OPEN":
+            sym = row["symbol"]
+            open_symbols.add(sym)
+            ltp = live_prices.get(sym)
+            sl, target, entry, qty = float(row["sl"]), float(row["target"]), float(row["entry"]), int(row["qty"])
+            if ltp and (ltp <= sl or ltp >= target):
+                outcome = "TARGET_HIT" if ltp >= target else "SL_HIT"
+                pnl = round((ltp - entry) * qty, 2)
+                cash += ltp * qty
+                trades_ws.update(f"D{idx}", [[outcome]])
+                trades_ws.update(f"I{idx}:J{idx}", [[ltp, pnl]])
+                open_symbols.discard(sym)
+                log_msg(
+                    sh, cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", outcome,
+                    f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}", {"symbol": sym, "pnl": pnl}
+                )
 
-    def render_agent_column(col, title, border_color, records, empty_hint):
-        with col:
-            bubbles_html = ""
-            if not records:
-                bubbles_html = f"<div class='chat-bubble' style='border-left-color:{border_color};'>{empty_hint}</div>"
-            else:
-                for r in records:
-                    parts = str(r["timestamp"]).split(" ")
-                    ts = " ".join(parts[1:]) if len(parts) > 1 else str(r["timestamp"])
-                    bubbles_html += (
-                        f"<div class='chat-bubble' style='border-left-color:{border_color};'>"
-                        f"<span class='chat-time'>🤖 {ts}</span>{r['summary']}</div>"
-                    )
-            st.markdown(
-                f"<div class='agent-col' style='border-top: 3px solid {border_color};'>"
-                f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
-                f"<b style='font-size:13.5px;color:#f8fafc;'>{title}</b>"
-                f"<span style='color:#34d399;font-size:11px;'>● Online</span></div>"
-                f"{bubbles_html}</div>",
-                unsafe_allow_html=True,
+    # 2. Execute new virtual BUY orders (risk-sized and capped at 25% of available cash)
+    for d in decisions:
+        if d.action != "BUY" or d.conviction < 65 or d.symbol in open_symbols:
+            continue
+        risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
+        qty_by_risk = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
+        max_qty_by_cash = int((cash * 0.25) // d.entry_price)
+        qty = min(qty_by_risk, max_qty_by_cash)
+        cost = qty * d.entry_price
+        if qty > 0 and cost <= cash:
+            cash -= cost
+            open_symbols.add(d.symbol)
+            trades_ws.append_row([
+                now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+                d.symbol, d.risk_tier, "OPEN", qty, d.entry_price, d.stop_loss, d.target_price, "", 0, d.reasoning
+            ])
+            log_msg(
+                sh, cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "PAPER_BUY",
+                f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
+                d.model_dump()
             )
 
-    render_agent_column(c_ag1, "🛡️ AG1 – Low Risk", "#10b981", ag1_msgs, "Scanning low-beta NIFTY 200 large caps...")
-    render_agent_column(c_ag2, "📈 AG2 – Mid Risk", "#3b82f6", ag2_msgs, "Scanning momentum & RVOL breakouts...")
-    render_agent_column(c_ag3, "🚀 AG3 – High Risk", "#f97316", ag3_msgs, "Scanning high-beta intraday movers...")
-    render_agent_column(c_ag4, "🧠 AG4 – Chief Analyst", "#a855f7", ag4_msgs, "Awaiting proposals + news sentiment audit...")
-    render_agent_column(c_ag5, "⚡ AG5 – Executor", "#06b6d4", ag5_msgs, "Monitoring bracket orders & SL/TP...")
+    acct_ws.update("A2", [[round(cash, 2)]])
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    b1, b2, b3 = st.columns([1.2, 1.3, 1.5])
-    with b1:
-        st.markdown("#### 🏆 Final Recommendation (AG4)")
-        latest_buy = None
-        if ag4_msgs:
-            try:
-                payload = json.loads(ag4_msgs[0]["payload_json"])
-                buys = [t for t in payload.get("selected_trades", []) if t.get("action") == "BUY"]
-                if buys:
-                    latest_buy = buys[0]
-            except Exception:
-                pass
-        if latest_buy:
-            rr_val = round((latest_buy["target_price"] - latest_buy["entry_price"]) / max(latest_buy["entry_price"] - latest_buy["stop_loss"], 0.01), 1)
-            st.markdown(f"""
-            <div class="panel-box" style="min-height:250px;">
-                <div class="rec-ticker">{latest_buy['symbol']}</div>
-                <div style="color:#94a3b8;font-size:12px;margin-bottom:10px;">Tier: <b>{latest_buy['risk_tier']}</b> • Conviction: <b>{latest_buy['conviction']}%</b></div>
-                <div style="font-size:13px;line-height:1.8;">
-                    <b>Entry Price:</b> ₹{latest_buy['entry_price']:,.2f}<br>
-                    <b>Stop Loss:</b> <span style="color:#f87171;">₹{latest_buy['stop_loss']:,.2f}</span><br>
-                    <b>Target Price:</b> <span style="color:#34d399;">₹{latest_buy['target_price']:,.2f}</span><br>
-                    <b>Risk / Reward:</b> 1 : {rr_val}
-                </div>
-                <div style="margin-top:10px;padding:8px;background:#131f38;border-radius:8px;font-size:12px;color:#cbd5e1;">✓ {latest_buy['reasoning']}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown("<div class='panel-box' style='min-height:250px;'><div class='rec-ticker'>READY TO SCAN</div><p style='color:#94a3b8;font-size:13px;'>Scans 250 NSE stocks + live intraday movers every 15 mins during NSE hours.</p></div>", unsafe_allow_html=True)
 
-    with b2:
-        st.markdown("#### 💼 Portfolio & Live Equity")
-        st.markdown(f"""
-        <div class="panel-box" style="min-height:250px;">
-            <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
-                <div>
-                    <div style="color:#94a3b8;font-size:12px;">Live Total Equity</div>
-                    <div class="metric-big">₹{total_portfolio:,.2f}</div>
-                    <div style="color:{'#34d399' if overall_ret_pct >= 0 else '#f87171'};font-size:12px;">{overall_ret_pct:+.2f}% overall</div>
-                </div>
-                <div>
-                    <div style="color:#94a3b8;font-size:12px;">Unrealized P&L</div>
-                    <div class="metric-big" style="color:{'#34d399' if unrealized_pnl_total >= 0 else '#f87171'};">₹{unrealized_pnl_total:+,.2f}</div>
-                    <div style="color:#94a3b8;font-size:12px;">Realized: ₹{realized_pnl:,.2f}</div>
-                </div>
-            </div>
-            <div style="font-size:12.5px;color:#cbd5e1;line-height:1.9;border-top:1px solid #1e293b;padding-top:10px;">
-                <b>Available Cash:</b> ₹{cash:,.2f}<br>
-                <b>Invested Value (Live):</b> ₹{current_holdings_val:,.2f}<br>
-                <b>Active Positions:</b> {len(open_t)} NSE stocks
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
+    sh = get_gsheet_client(gcp_creds_dict)
+    client = genai.Client(api_key=api_key.strip())
+    cycle_id = now_ist().strftime("CYC-%H%M%S-IST")
 
-    with b3:
-        st.markdown("#### 📜 Recent Trade History (IST)")
-        if trades_df.empty:
-            st.markdown("<div class='panel-box' style='min-height:250px;'><p style='color:#94a3b8;font-size:13px;'>No paper orders executed yet.</p></div>", unsafe_allow_html=True)
-        else:
-            display_df = trades_df[["timestamp", "symbol", "tier", "qty", "entry", "status", "pnl"]].head(6).copy()
-            display_df["timestamp"] = display_df["timestamp"].apply(lambda x: " ".join(str(x).split(" ")[1:]) if len(str(x).split(" ")) > 1 else str(x))
-            display_df.columns = ["Time (IST)", "Stock", "Tier", "Qty", "Entry (₹)", "Status", "Realized P&L"]
-            st.dataframe(display_df, use_container_width=True, hide_index=True, height=250)
+    existing_trades = sh.worksheet("trades").get_all_records()
+    open_holdings = {r["symbol"] for r in existing_trades if r.get("status") == "OPEN"}
 
-# ------------------------------------------------------------------------------
-# TAB 2: LIVE INTERACTIVE STOCK CHARTS (PORTFOLIO & WATCHLIST)
-# ------------------------------------------------------------------------------
-with tab_charts:
-    st.markdown("#### 📈 Interactive Live NSE Stock Chart & Bracket Levels")
-    portfolio_syms = open_t["symbol"].tolist() if not open_t.empty else []
-    default_syms = ["NIFTY 50 (^NSEI)", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS"]
-    selectable_stocks = list(dict.fromkeys(portfolio_syms + default_syms))
+    market_data, live_prices, mover_count = fetch_nse_metrics(excluded_symbols=open_holdings)
+    scanned_count = len(live_prices)
 
-    ch1, ch2, ch3 = st.columns([2, 1.5, 1.5])
-    with ch1:
-        selected_label = st.selectbox("Select Stock (Portfolio holdings listed first)", selectable_stocks)
-        chart_sym = "^NSEI" if "NIFTY 50" in selected_label else selected_label
-    with ch2:
-        tf_choice = st.selectbox("Timeframe & Candle Interval", [
-            "Intraday 5 Days (15m)",
-            "Intraday 1 Day (5m)",
-            "Swing 1 Month (1h)",
-            "Trend 6 Months (1d)",
-        ])
-    with ch3:
-        chart_style = st.radio("Chart Type", ["Candlestick", "Area Line"], horizontal=True)
+    ag1_pool = [d for d in market_data if d["beta"] <= 1.05 and d["ltp"] >= d["sma_200"] and d["rsi_14"] <= 72]
+    ag1_slice = sorted(ag1_pool or market_data, key=lambda x: (x["beta"], -x["rvol"]))[:15]
 
-    tf_map = {
-        "Intraday 5 Days (15m)": ("5d", "15m"),
-        "Intraday 1 Day (5m)": ("1d", "5m"),
-        "Swing 1 Month (1h)": ("1mo", "1h"),
-        "Trend 6 Months (1d)": ("6mo", "1d"),
-    }
-    p_arg, i_arg = tf_map[tf_choice]
-    hist_df = get_stock_chart_data(chart_sym, p_arg, i_arg)
+    ag2_pool = [d for d in market_data if 0.85 <= d["beta"] <= 1.55 and 45 <= d["rsi_14"] <= 68]
+    ag2_slice = sorted(ag2_pool or market_data, key=lambda x: x["rvol"], reverse=True)[:15]
 
-    # Check if selected stock is in open portfolio to overlay Entry / SL / Target lines
-    holding_row = None
-    if not open_t.empty and chart_sym in open_t["symbol"].values:
-        holding_row = open_t[open_t["symbol"] == chart_sym].iloc[0]
+    ag3_pool = [d for d in market_data if d["beta"] >= 1.25 or abs(d["day_change_pct"]) >= 1.5]
+    ag3_slice = sorted(ag3_pool or market_data, key=lambda x: (abs(x["day_change_pct"]) * x["rvol"]), reverse=True)[:15]
 
-    if hist_df.empty:
-        st.warning(f"No intraday candle data returned right now for {chart_sym}. Try switching timeframe to 'Trend 6 Months (1d)'.")
-    else:
-        curr_px = float(hist_df["Close"].iloc[-1])
-        prev_px = float(hist_df["Close"].iloc[0])
-        chg_pct = ((curr_px - prev_px) / prev_px) * 100
+    ag1 = await run_screener(
+        sh, client, cycle_id, "AG1_LOW_RISK",
+        "Focus on LOW-RISK large-cap stability (lowest beta, price above 200-SMA, RSI under 72, tight 1.5x ATR stop).",
+        ag1_slice, scanned_count, mover_count
+    )
+    ag2 = await run_screener(
+        sh, client, cycle_id, "AG2_MID_RISK",
+        "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
+        ag2_slice, scanned_count, mover_count
+    )
+    ag3 = await run_screener(
+        sh, client, cycle_id, "AG3_HIGH_RISK",
+        "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move with volume, tight 1x ATR stop).",
+        ag3_slice, scanned_count, mover_count
+    )
 
-        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        m_col1.metric(f"{chart_sym} Live Price", f"₹{curr_px:,.2f}", f"{chg_pct:+.2f}% ({p_arg})")
-        if holding_row is not None:
-            m_col2.metric("Your Entry Price", f"₹{holding_row['entry']:,.2f}", f"{holding_row['pnl_pct']:+.2f}% P&L")
-            m_col3.metric("Stop Loss (Red)", f"₹{holding_row['sl']:,.2f}", f"₹{holding_row['unrealized_pnl']:+,.2f} Unrealized")
-            m_col4.metric("Target Price (Green)", f"₹{holding_row['target']:,.2f}", f"Qty: {int(holding_row['qty'])} ({holding_row['tier']})")
-
-        fig = go.Figure()
-        if chart_style == "Candlestick":
-            fig.add_trace(go.Candlestick(
-                x=hist_df.index,
-                open=hist_df["Open"],
-                high=hist_df["High"],
-                low=hist_df["Low"],
-                close=hist_df["Close"],
-                name=chart_sym,
-                increasing_line_color="#10b981",
-                decreasing_line_color="#ef4444",
-            ))
-        else:
-            fig.add_trace(go.Scatter(
-                x=hist_df.index,
-                y=hist_df["Close"],
-                mode="lines",
-                fill="tozeroy",
-                line=dict(color="#38bdf8", width=2.5),
-                fillcolor="rgba(56, 189, 248, 0.12)",
-                name=chart_sym,
-            ))
-
-        # Overlay Bracket Order Levels if held in portfolio
-        if holding_row is not None:
-            fig.add_hline(y=float(holding_row["entry"]), line_dash="dash", line_color="#38bdf8", annotation_text=f"Entry ₹{holding_row['entry']:,.2f}")
-            fig.add_hline(y=float(holding_row["sl"]), line_dash="dot", line_color="#f87171", annotation_text=f"Stop-Loss ₹{holding_row['sl']:,.2f}")
-            fig.add_hline(y=float(holding_row["target"]), line_dash="dash", line_color="#34d399", annotation_text=f"Target ₹{holding_row['target']:,.2f}")
-
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="#0b1324",
-            plot_bgcolor="#081020",
-            height=480,
-            margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_rangeslider_visible=False,
-            yaxis_title="Price (₹ INR)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# ------------------------------------------------------------------------------
-# TAB 3: PORTFOLIO & LIVE MARK-TO-MARKET P&L (WITH MANUAL SELL OPTION)
-# ------------------------------------------------------------------------------
-with tab_port:
-    st.markdown("#### 💼 Active Virtual NSE Holdings & Live Mark-to-Market P&L")
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Available Cash", f"₹{cash:,.2f}")
-    p2.metric("Holdings Market Value", f"₹{current_holdings_val:,.2f}")
-    p3.metric("Live Unrealized P&L", f"₹{unrealized_pnl_total:+,.2f}")
-    p4.metric("Total Account Equity", f"₹{total_portfolio:,.2f}", f"{overall_ret_pct:+.2f}%")
-    st.divider()
-
-    if open_t.empty:
-        st.info("No open positions held right now.")
-    else:
-        port_view = open_t[["timestamp", "symbol", "tier", "qty", "entry", "live_ltp", "sl", "target", "unrealized_pnl", "pnl_pct"]].copy()
-        port_view.columns = ["Opened (IST)", "Stock", "Tier", "Qty", "Entry (₹)", "Live LTP (₹)", "Stop Loss (₹)", "Target (₹)", "Unrealized P&L (₹)", "Return %"]
-        st.dataframe(port_view, use_container_width=True, hide_index=True)
-
-        st.markdown("##### 🛑 Manual Position Exit (Sell at Live Market Price)")
-        sell_c1, sell_c2 = st.columns([2, 1])
-        with sell_c1:
-            sym_to_close = st.selectbox("Select Open Position to Close Manually", open_t["symbol"].tolist())
-        with sell_c2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("💸 Close Position at Market LTP", use_container_width=True):
-                trades_ws = sh.worksheet("trades")
-                acct_ws = sh.worksheet("account")
-                all_rows = trades_ws.get_all_records()
-                for idx, row in enumerate(all_rows, start=2):
-                    if row.get("symbol") == sym_to_close and row.get("status") == "OPEN":
-                        exit_px = float(live_ltp_map.get(sym_to_close, row["entry"]))
-                        qty_val = int(row["qty"])
-                        entry_val = float(row["entry"])
-                        pnl_val = round((exit_px - entry_val) * qty_val, 2)
-                        new_cash = round(cash + exit_px * qty_val, 2)
-                        trades_ws.update(f"D{idx}", [["MANUAL_EXIT"]])
-                        trades_ws.update(f"I{idx}:J{idx}", [[exit_px, pnl_val]])
-                        acct_ws.update("A2", [[new_cash]])
-                        sh.worksheet("agent_messages").append_row([
-                            now_ist().strftime("MAN-%H%M%S-IST"),
-                            now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-                            "AG5_EXECUTION_BROKER",
-                            "PORTFOLIO_LEDGER",
-                            "MANUAL_EXIT",
-                            f"MANUAL SELL {qty_val} {sym_to_close} @ ₹{exit_px} | Net P&L: ₹{pnl_val}",
-                            json.dumps({"symbol": sym_to_close, "exit_price": exit_px, "pnl": pnl_val}),
-                        ])
-                        break
-                st.cache_data.clear()
-                st.toast(f"Closed {sym_to_close}!", icon="✅")
-                st.rerun()
-
-# ------------------------------------------------------------------------------
-# TAB 4: AGENT INTELLIGENCE INSPECTOR
-# ------------------------------------------------------------------------------
-with tab_agents:
-    st.markdown("#### 🤖 Individual Agent Decision Inspector & JSON Payloads")
-    a_tabs = st.tabs(["🛡️ AG1 (Low Risk)", "📈 AG2 (Mid Risk)", "🚀 AG3 (High Risk)", "🧠 AG4 (Chief Analyst)", "⚡ AG5 (Executor)"])
-    codes = ["AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK", "AG4_CHIEF_ANALYST", "AG5_EXECUTION_BROKER"]
-    for t_obj, code in zip(a_tabs, codes):
-        with t_obj:
-            sub = msgs_df[msgs_df["sender"] == code] if not msgs_df.empty else pd.DataFrame()
-            if sub.empty:
-                st.write("No logs recorded yet.")
-            else:
-                for _, r in sub.head(10).iterrows():
-                    st.markdown(f"**`{r['timestamp']}` ({r['cycle_id']})** — {r['summary']}")
-                    with st.expander("Inspect Structured Reasoning JSON"):
-                        st.code(r["payload_json"], language="json")
-
-# ------------------------------------------------------------------------------
-# TAB 5: FULL TRADE & COMMUNICATION AUDIT LEDGER
-# ------------------------------------------------------------------------------
-with tab_logs:
-    l1, l2 = st.columns(2)
-    with l1:
-        st.markdown("#### 📜 Complete 30-Day Trade Ledger (IST)")
-        st.dataframe(trades_df, use_container_width=True, hide_index=True) if not trades_df.empty else st.write("No trades yet.")
-    with l2:
-        st.markdown("#### 💬 Inter-Agent Message Stream (IST)")
-        for _, r in msgs_df.head(30).iterrows():
-            with st.chat_message("assistant"):
-                st.markdown(f"**`{r['timestamp']}`** — **{r['sender']}** ➡️ **{r['recipient']}**")
-                st.write(r["summary"])
-
-# --- OPTIONAL 60-SECOND LIVE AUTO-REFRESH ---
-if auto_refresh:
-    import time
-    time.sleep(60)
-    st.cache_data.clear()
-    st.rerun()
+    candidates = ag1 + ag2 + ag3
+    decisions = (await run_ag4(sh, client, cycle_id, candidates)).selected_trades if candidates else []
+    ag5_broker_step(sh, cycle_id, decisions, live_prices)
