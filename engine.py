@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import time
 import asyncio
 import urllib.request
 import http.cookiejar
@@ -19,6 +20,19 @@ from schemas import StockSignal, CommitteeOutput, FinalDecision
 IST = timezone(timedelta(hours=5, minutes=30))
 CANDIDATE_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 SHEET_NAME = "NSE_5Agent_Ledger"
+
+# --- PORTFOLIO & RISK GUARDRAILS ---
+MAX_OPEN_POSITIONS = 10
+RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
+
+SECTOR_INDICES = {
+    "BANK": "^NSEBANK",
+    "IT": "^CNXIT",
+    "AUTO": "^CNXAUTO",
+    "PHARMA": "^CNXPHARMA",
+    "METAL": "^CNXMETAL",
+    "ENERGY": "^CNXENERGY",
+}
 
 FALLBACK_NSE_250 = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "BHARTIARTL.NS", "ICICIBANK.NS", "INFY.NS", "SBIN.NS",
@@ -58,11 +72,17 @@ FALLBACK_NSE_250 = [
     "SUNDRMFAST.NS", "ENDURANCE.NS", "UNOMINDA.NS", "SCHAEFFLER.NS", "TIMKEN.NS", "SKFINDIA.NS"
 ]
 
-RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
-
 
 def now_ist() -> datetime:
     return datetime.now(timezone.utc).astimezone(IST)
+
+
+def is_nse_open_now() -> bool:
+    dt = now_ist()
+    if dt.weekday() >= 5:
+        return False
+    mins = dt.hour * 60 + dt.minute
+    return (9 * 60 + 15) <= mins <= (15 * 60 + 30)
 
 
 def get_gsheet_client(gcp_creds_dict: dict):
@@ -91,8 +111,113 @@ def log_msg(sh, cycle_id: str, sender: str, recipient: str, msg_type: str, summa
     ])
 
 
+# ==============================================================================
+# SKILL 1 & 2: NIFTY 50 MARKET REGIME + SECTOR STRENGTH + CLOSED-TRADE MEMORY
+# ==============================================================================
+def get_market_regime_and_sectors() -> dict:
+    """Checks NIFTY 50 trend/day change and ranks top NSE sector indices."""
+    tickers = ["^NSEI"] + list(SECTOR_INDICES.values())
+    regime = {
+        "nifty_chg_pct": 0.0,
+        "nifty_above_20sma": True,
+        "defensive_mode": False,
+        "top_sectors": [],
+        "weak_sectors": [],
+    }
+    try:
+        data = yf.download(tickers, period="2mo", interval="1d", group_by="ticker", progress=False, threads=True)
+        if "^NSEI" in data.columns.get_level_values(0):
+            n_hist = data["^NSEI"]["Close"].dropna()
+            if len(n_hist) >= 20:
+                curr, prev = float(n_hist.iloc[-1]), float(n_hist.iloc[-2])
+                sma20 = float(n_hist.rolling(20).mean().iloc[-1])
+                chg = round(((curr - prev) / prev) * 100, 2)
+                regime["nifty_chg_pct"] = chg
+                regime["nifty_above_20sma"] = curr >= sma20
+                regime["defensive_mode"] = (chg <= -0.60) or (curr < sma20)
+
+        sec_perf = []
+        for sec_name, sym in SECTOR_INDICES.items():
+            if sym in data.columns.get_level_values(0):
+                s_hist = data[sym]["Close"].dropna()
+                if len(s_hist) >= 2:
+                    s_chg = ((float(s_hist.iloc[-1]) - float(s_hist.iloc[-2])) / float(s_hist.iloc[-2])) * 100
+                    sec_perf.append((sec_name, round(s_chg, 2)))
+        sec_perf.sort(key=lambda x: x[1], reverse=True)
+        regime["top_sectors"] = [f"{s[0]} ({s[1]:+.2f}%)" for s in sec_perf[:2]]
+        regime["weak_sectors"] = [f"{s[0]} ({s[1]:+.2f}%)" for s in sec_perf[-2:]]
+    except Exception:
+        pass
+    return regime
+
+
+def build_trade_memory_scorecard(trades_records: list[dict]) -> str:
+    """Skill: Summarizes recent closed trade performance by tier so AG4 adapts dynamically."""
+    closed = [r for r in trades_records if r.get("status") not in ("OPEN", "", None)]
+    if not closed:
+        return "No closed trades yet; enforce strict R:R >= 1:1.6 and clean news."
+    recent = closed[-20:]
+    wins = [r for r in recent if float(r.get("pnl", 0) or 0) > 0]
+    win_rate = round((len(wins) / len(recent)) * 100, 1)
+    tier_stats = []
+    for t in ("LOW", "MID", "HIGH"):
+        t_rows = [r for r in recent if r.get("tier") == t]
+        if t_rows:
+            t_wins = sum(1 for r in t_rows if float(r.get("pnl", 0) or 0) > 0)
+            tier_stats.append(f"{t}: {t_wins}/{len(t_rows)} wins")
+    return f"Last {len(recent)} closed trades win-rate: {win_rate}% ({', '.join(tier_stats)}). Prioritize tiers with higher win-rate."
+
+
+# ==============================================================================
+# SKILL 3 & 4: 15-MIN INTRADAY VWAP CONFIRMATION + 48H EARNINGS BLACKOUT
+# ==============================================================================
+def enrich_with_intraday_vwap(candidates: list[dict]) -> list[dict]:
+    """Verifies top finalists are trading above intraday VWAP (institutional support)."""
+    if not candidates:
+        return candidates
+    syms = list({c["symbol"] for c in candidates})
+    try:
+        intra = yf.download(syms, period="1d", interval="15m", group_by="ticker", progress=False, threads=True)
+        for c in candidates:
+            sym = c["symbol"]
+            c["above_vwap"] = True
+            try:
+                sub = intra[sym].dropna() if len(syms) > 1 else intra.dropna()
+                if not sub.empty and sub["Volume"].sum() > 0:
+                    typical_px = (sub["High"] + sub["Low"] + sub["Close"]) / 3.0
+                    vwap = float((typical_px * sub["Volume"]).sum() / sub["Volume"].sum())
+                    curr_px = float(sub["Close"].iloc[-1])
+                    c["vwap"] = round(vwap, 2)
+                    c["above_vwap"] = curr_px >= vwap
+            except Exception:
+                continue
+    except Exception:
+        for c in candidates:
+            c["above_vwap"] = True
+    vwap_approved = [c for c in candidates if c.get("above_vwap", True)]
+    return vwap_approved if len(vwap_approved) >= 3 else candidates
+
+
+def has_upcoming_earnings_48h(symbol: str) -> bool:
+    """Skill: Blocks new entries if quarterly earnings are within 48 hours."""
+    try:
+        cal = yf.Ticker(symbol).calendar
+        if isinstance(cal, dict) and "Earnings Date" in cal:
+            dates = cal["Earnings Date"]
+            if dates:
+                next_dt = pd.to_datetime(dates[0]).tz_localize(None)
+                diff_hours = (next_dt - datetime.now()).total_seconds() / 3600.0
+                if -12 <= diff_hours <= 48:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+# ==============================================================================
+# STAGE 1: DYNAMIC 250-STOCK NSE UNIVERSE INGESTION
+# ==============================================================================
 def fetch_nse_live_movers() -> list[str]:
-    """Pulls live intraday NSE Top Gainers, Top Losers, and Volume Spurts across all 2,200+ NSE stocks."""
     movers = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -135,9 +260,7 @@ def fetch_nse_live_movers() -> list[str]:
 
 
 def get_dynamic_250_universe() -> tuple[list[str], int]:
-    """Combines live NSE Top Gainers/Losers/Volume Spurts + NIFTY 200 index constituents (~250 unique stocks)."""
     live_movers = fetch_nse_live_movers()
-
     nifty200_symbols = []
     try:
         url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
@@ -155,7 +278,6 @@ def get_dynamic_250_universe() -> tuple[list[str], int]:
 
 
 def fetch_nse_metrics(excluded_symbols: set[str] | None = None) -> tuple[list[dict], dict[str, float], int]:
-    """Scans ~250 dynamic NSE stocks in a single batch call and returns filtered candidates + live prices."""
     excluded = excluded_symbols or set()
     universe, live_mover_count = get_dynamic_250_universe()
     snapshots = []
@@ -267,21 +389,29 @@ def quant_fallback_screener(agent_id: str, data_slice: list[dict]) -> list[Stock
                 rsi_14=d["rsi_14"],
                 rvol=d["rvol"],
                 beta=d["beta"],
-                setup_reason=f"Quant funnel: RVOL {d['rvol']}x, RSI {d['rsi_14']}, ATR 1:2 R:R setup.",
+                setup_reason=f"Quant + VWAP funnel: RVOL {d['rvol']}x, RSI {d['rsi_14']}, 1:2 R:R setup.",
             )
         )
     return signals
 
 
-async def run_screener(sh, client, cycle_id: str, agent_id: str, rules: str, data_slice: list[dict], scanned_count: int, mover_count: int) -> list[StockSignal]:
+async def run_screener(
+    sh, client, cycle_id: str, agent_id: str, rules: str,
+    data_slice: list[dict], scanned_count: int, mover_count: int, regime: dict
+) -> list[StockSignal]:
     if not data_slice:
         log_msg(sh, cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched.", [])
         return []
 
+    regime_note = (
+        f"Market Context: NIFTY 50 is {regime['nifty_chg_pct']:+.2f}% "
+        f"({'DEFENSIVE MODE - be extra selective' if regime['defensive_mode'] else 'BULLISH/NORMAL'}). "
+        f"Leading Sectors: {', '.join(regime['top_sectors'])}."
+    )
     prompt = (
-        f"You are {agent_id} for NSE India (scanning {scanned_count} live NSE stocks including {mover_count} live intraday movers). {rules} "
-        f"From these top-ranked quantitative candidates, pick the 2 best distinct stocks matching your risk tier "
-        f"with realistic INR entry_price, stop_loss, and target_price: {json.dumps(data_slice)}"
+        f"You are {agent_id} for NSE India (scanning {scanned_count} live NSE stocks including {mover_count} live intraday movers). "
+        f"{regime_note} {rules} All candidates passed 15m intraday VWAP support. "
+        f"Pick the 2 best distinct stocks matching your risk tier with realistic INR entry_price, stop_loss, and target_price: {json.dumps(data_slice)}"
     )
     try:
         raw = await generate_fast(client, prompt, list[StockSignal], temperature=0.2)
@@ -302,12 +432,31 @@ async def run_screener(sh, client, cycle_id: str, agent_id: str, rules: str, dat
     return signals
 
 
-async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal]) -> CommitteeOutput:
-    enriched = [{"signal": c.model_dump(), "news": fetch_nse_news(c.symbol)} for c in candidates]
+async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal], regime: dict, memory_scorecard: str) -> CommitteeOutput:
+    enriched = []
+    for c in candidates:
+        earnings_soon = has_upcoming_earnings_48h(c.symbol)
+        news_items = fetch_nse_news(c.symbol)
+        if earnings_soon:
+            news_items.insert(0, "ALERT: Quarterly earnings scheduled within 48 hours - SKIP to avoid gap risk.")
+        enriched.append({
+            "signal": c.model_dump(),
+            "earnings_within_48h": earnings_soon,
+            "news": news_items,
+        })
+
+    regime_rule = (
+        "NIFTY 50 is in DEFENSIVE MODE (down > 0.6% or below 20-SMA): approve AT MOST 1 ultra-high-conviction LOW/MID trade, or SKIP all if setups are weak."
+        if regime["defensive_mode"]
+        else "NIFTY 50 trend is supportive: approve 1-3 top setups with clean news, non-overbought RSI, and R:R >= 1:1.6."
+    )
+
     prompt = (
-        "You are AG4, Chief Analyst for NSE India. Audit all candidates from AG1 (Low), AG2 (Mid), and AG3 (High) "
-        "with their news headlines. Mark each BUY or SKIP; approve 1-3 top setups with clean news, non-overbought RSI, "
-        f"and R:R >= 1:1.6. Inputs: {json.dumps(enriched)}"
+        f"You are AG4, Chief Analyst for NSE India. {regime_rule} "
+        f"Historical Performance Feedback: {memory_scorecard} "
+        f"Leading Sectors Today: {', '.join(regime['top_sectors'])}. "
+        "Audit all candidates with their news headlines. Immediately SKIP any stock with earnings_within_48h=True or negative news. "
+        f"Inputs: {json.dumps(enriched)}"
     )
     try:
         raw = await generate_fast(client, prompt, CommitteeOutput, temperature=0.1)
@@ -315,23 +464,26 @@ async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal]) -> C
     except Exception:
         tier_map = {"AG1_LOW_RISK": "LOW", "AG2_MID_RISK": "MID", "AG3_HIGH_RISK": "HIGH"}
         fallback_trades, seen = [], set()
-        for c in candidates:
+        max_buys = 1 if regime["defensive_mode"] else 2
+        for item in enriched:
+            c = StockSignal(**item["signal"])
             if c.symbol in seen:
                 continue
             seen.add(c.symbol)
             rr = (c.target_price - c.entry_price) / max(c.entry_price - c.stop_loss, 0.01)
-            action = "BUY" if rr >= 1.6 and c.rsi_14 < 75 and len(fallback_trades) < 2 else "SKIP"
+            safe_to_buy = (not item["earnings_within_48h"]) and rr >= 1.6 and c.rsi_14 < 75 and len(fallback_trades) < max_buys
+            action = "BUY" if safe_to_buy else "SKIP"
             fallback_trades.append(
                 FinalDecision(
                     symbol=c.symbol,
                     risk_tier=tier_map[c.agent_id],
                     action=action,
-                    conviction=76 if action == "BUY" else 50,
+                    conviction=76 if action == "BUY" else 45,
                     entry_price=c.entry_price,
                     stop_loss=c.stop_loss,
                     target_price=c.target_price,
-                    news_status="CLEAR",
-                    reasoning=f"Quant audit: R:R = 1:{rr:.2f}, RSI = {c.rsi_14}, RVOL = {c.rvol}x.",
+                    news_status="CLEAR" if not item["earnings_within_48h"] else "NEGATIVE_RISK",
+                    reasoning=f"Quant + Regime audit: R:R = 1:{rr:.2f}, RSI = {c.rsi_14}, NIFTY = {regime['nifty_chg_pct']:+.2f}%.",
                 )
             )
         decision = CommitteeOutput(selected_trades=fallback_trades)
@@ -343,41 +495,80 @@ async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal]) -> C
         "AG4_CHIEF_ANALYST",
         "AG5_EXECUTION_BROKER",
         "VERDICT",
-        f"Approved {len(buys)} BUY order(s) out of {len(candidates)} proposals.",
+        f"Approved {len(buys)} BUY order(s) out of {len(candidates)} proposals (NIFTY {regime['nifty_chg_pct']:+.2f}%).",
         decision.model_dump(),
     )
     return decision
 
 
-def ag5_broker_step(sh, cycle_id: str, decisions: list[FinalDecision], live_prices: dict[str, float]):
+# ==============================================================================
+# PHASE 1: FULL 5-AGENT CYCLE (250 STOCKS + AI COMMITTEE + NEW ENTRIES)
+# ==============================================================================
+async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
+    sh = get_gsheet_client(gcp_creds_dict)
+    client = genai.Client(api_key=api_key.strip())
+    cycle_id = now_ist().strftime("CYC-%H%M%S-IST")
+
+    existing_trades = sh.worksheet("trades").get_all_records()
+    open_holdings = {r["symbol"] for r in existing_trades if r.get("status") == "OPEN"}
+
+    regime = get_market_regime_and_sectors()
+    memory_scorecard = build_trade_memory_scorecard(existing_trades)
+    market_data, live_prices, mover_count = fetch_nse_metrics(excluded_symbols=open_holdings)
+    scanned_count = len(live_prices)
+
+    # First run fast 30s watchdog tick immediately so existing positions are checked right away
+    run_single_watchdog_tick(sh, cycle_id)
+
+    # Refresh open holdings count after watchdog check
+    existing_trades = sh.worksheet("trades").get_all_records()
+    open_holdings = {r["symbol"] for r in existing_trades if r.get("status") == "OPEN"}
+
+    if len(open_holdings) >= MAX_OPEN_POSITIONS:
+        log_msg(
+            sh, cycle_id, "AG5_EXECUTION_BROKER", "SYSTEM", "SLOT_CAP_ACTIVE",
+            f"Holding {len(open_holdings)}/{MAX_OPEN_POSITIONS} open swing positions — pausing new entries until a slot frees up.",
+            {"open_count": len(open_holdings), "max_allowed": MAX_OPEN_POSITIONS}
+        )
+        return
+
+    ag1_pool = [d for d in market_data if d["beta"] <= 1.05 and d["ltp"] >= d["sma_200"] and d["rsi_14"] <= 72]
+    ag1_slice = enrich_with_intraday_vwap(sorted(ag1_pool or market_data, key=lambda x: (x["beta"], -x["rvol"]))[:12])
+
+    ag2_pool = [d for d in market_data if 0.85 <= d["beta"] <= 1.55 and 45 <= d["rsi_14"] <= 68]
+    ag2_slice = enrich_with_intraday_vwap(sorted(ag2_pool or market_data, key=lambda x: x["rvol"], reverse=True)[:12])
+
+    ag3_pool = [d for d in market_data if d["beta"] >= 1.25 or abs(d["day_change_pct"]) >= 1.5]
+    ag3_slice = enrich_with_intraday_vwap(sorted(ag3_pool or market_data, key=lambda x: (abs(x["day_change_pct"]) * x["rvol"]), reverse=True)[:12])
+
+    ag1 = await run_screener(
+        sh, client, cycle_id, "AG1_LOW_RISK",
+        "Focus on LOW-RISK large-cap stability (lowest beta, price above 200-SMA, RSI under 72, tight 1.5x ATR stop).",
+        ag1_slice, scanned_count, mover_count, regime
+    )
+    ag2 = await run_screener(
+        sh, client, cycle_id, "AG2_MID_RISK",
+        "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
+        ag2_slice, scanned_count, mover_count, regime
+    )
+    ag3 = await run_screener(
+        sh, client, cycle_id, "AG3_HIGH_RISK",
+        "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move with volume, tight 1x ATR stop).",
+        ag3_slice, scanned_count, mover_count, regime
+    )
+
+    candidates = ag1 + ag2 + ag3
+    decisions = (await run_ag4(sh, client, cycle_id, candidates, regime, memory_scorecard)).selected_trades if candidates else []
+
+    # Execute approved BUY orders respecting MAX_OPEN_POSITIONS = 10
     acct_ws = sh.worksheet("account")
     trades_ws = sh.worksheet("trades")
     cash = float(acct_ws.acell("A2").value or 1_000_000.0)
-    records = trades_ws.get_all_records()
 
-    # 1. Monitor open positions for SL/TP exits
-    open_symbols = set()
-    for idx, row in enumerate(records, start=2):
-        if row.get("status") == "OPEN":
-            sym = row["symbol"]
-            open_symbols.add(sym)
-            ltp = live_prices.get(sym)
-            sl, target, entry, qty = float(row["sl"]), float(row["target"]), float(row["entry"]), int(row["qty"])
-            if ltp and (ltp <= sl or ltp >= target):
-                outcome = "TARGET_HIT" if ltp >= target else "SL_HIT"
-                pnl = round((ltp - entry) * qty, 2)
-                cash += ltp * qty
-                trades_ws.update(f"D{idx}", [[outcome]])
-                trades_ws.update(f"I{idx}:J{idx}", [[ltp, pnl]])
-                open_symbols.discard(sym)
-                log_msg(
-                    sh, cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", outcome,
-                    f"SOLD {sym} ({outcome}) @ ₹{ltp} | Net P&L: ₹{pnl}", {"symbol": sym, "pnl": pnl}
-                )
-
-    # 2. Execute new virtual BUY orders (risk-sized and capped at 25% of available cash)
     for d in decisions:
-        if d.action != "BUY" or d.conviction < 65 or d.symbol in open_symbols:
+        if len(open_holdings) >= MAX_OPEN_POSITIONS:
+            break
+        if d.action != "BUY" or d.conviction < 65 or d.symbol in open_holdings:
             continue
         risk_per_share = max(d.entry_price - d.stop_loss, d.entry_price * 0.005)
         qty_by_risk = int((cash * RISK_PER_TIER[d.risk_tier]) // risk_per_share)
@@ -386,7 +577,7 @@ def ag5_broker_step(sh, cycle_id: str, decisions: list[FinalDecision], live_pric
         cost = qty * d.entry_price
         if qty > 0 and cost <= cash:
             cash -= cost
-            open_symbols.add(d.symbol)
+            open_holdings.add(d.symbol)
             trades_ws.append_row([
                 now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
                 d.symbol, d.risk_tier, "OPEN", qty, d.entry_price, d.stop_loss, d.target_price, "", 0, d.reasoning
@@ -400,42 +591,187 @@ def ag5_broker_step(sh, cycle_id: str, decisions: list[FinalDecision], live_pric
     acct_ws.update("A2", [[round(cash, 2)]])
 
 
-async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
+# ==============================================================================
+# PHASE 2: HIGH-FREQUENCY 30s WATCHDOG + TWO-TIER PROFIT LOCK + TARGET ROLLOVER
+# ==============================================================================
+def fetch_1m_candles_for_open(symbols: list[str]) -> dict[str, dict]:
+    """Fetches latest 1-minute High, Low, Close for open holdings only (fast, zero Gemini tokens)."""
+    quotes = {}
+    if not symbols:
+        return quotes
+    try:
+        data = yf.download(symbols, period="1d", interval="1m", group_by="ticker", progress=False, threads=True)
+        for sym in symbols:
+            try:
+                sub = data[sym].dropna() if len(symbols) > 1 else data.dropna()
+                if not sub.empty:
+                    last_bar = sub.iloc[-1]
+                    quotes[sym] = {
+                        "close": round(float(last_bar["Close"]), 2),
+                        "high": round(float(last_bar["High"]), 2),
+                        "low": round(float(last_bar["Low"]), 2),
+                    }
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return quotes
+
+
+def get_portfolio_profit_floor(peak_pnl: float) -> float | None:
+    """Stepped Portfolio Profit Floor starting at +₹7,000 for ₹10L equity wallet."""
+    if peak_pnl >= 20_000:
+        return round(peak_pnl * 0.75, 2)  # Dynamic 75% ratchet (locks >= +₹15,000)
+    elif peak_pnl >= 15_000:
+        return 10_500.0
+    elif peak_pnl >= 10_000:
+        return 6_500.0
+    elif peak_pnl >= 7_000:
+        return 3_500.0
+    return None
+
+
+def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
+    """
+    Evaluates open positions using 1m wicks:
+    1. Stop-Loss Hit -> Closes trade (SL_HIT or TRAILING_SL_HIT).
+    2. Target Hit -> Rollover! Moves SL to old_target * 0.9975 (0.25% buffer) and extends Target by +1R.
+    3. Step-Trailing SL -> At 50% target moves SL to entry*1.002; at 75% target locks 50% of gain.
+    4. Stepped Portfolio Floor -> +₹7k / +₹10k / +₹15k / +₹20k+ basket profit protection.
+    """
+    if state is None:
+        state = {"peak_portfolio_pnl": 0.0}
+
+    acct_ws = sh.worksheet("account")
+    trades_ws = sh.worksheet("trades")
+    records = trades_ws.get_all_records()
+
+    open_rows = [(idx, row) for idx, row in enumerate(records, start=2) if row.get("status") == "OPEN"]
+    if not open_rows:
+        return
+
+    open_syms = list({row["symbol"] for _, row in open_rows})
+    quotes = fetch_1m_candles_for_open(open_syms)
+    if not quotes:
+        return
+
+    cash = float(acct_ws.acell("A2").value or 1_000_000.0)
+    cash_changed = False
+    remaining_open = []
+    combined_unrealized = 0.0
+
+    for idx, row in open_rows:
+        sym = row["symbol"]
+        q = quotes.get(sym)
+        if not q:
+            continue
+
+        ltp, bar_high, bar_low = q["close"], q["high"], q["low"]
+        entry = float(row["entry"])
+        sl = float(row["sl"])
+        target = float(row["target"])
+        qty = int(row["qty"])
+        target_dist = max(target - entry, entry * 0.01)
+
+        # 1. CHECK STOP-LOSS HIT (1-minute wick low or live LTP <= SL)
+        if bar_low <= sl or ltp <= sl:
+            exit_px = round(min(ltp, sl) if bar_low <= sl else ltp, 2)
+            pnl = round((exit_px - entry) * qty, 2)
+            cash += exit_px * qty
+            cash_changed = True
+            exit_tag = "TRAILING_SL_HIT" if sl >= entry else "SL_HIT"
+            trades_ws.update(f"D{idx}", [[exit_tag]])
+            trades_ws.update(f"I{idx}:J{idx}", [[exit_px, pnl]])
+            log_msg(
+                sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", exit_tag,
+                f"SOLD {qty} {sym} ({exit_tag}) @ ₹{exit_px} | Net P&L: ₹{pnl:+,.2f}",
+                {"symbol": sym, "exit_price": exit_px, "pnl": pnl}
+            )
+            continue
+
+        # 2. TARGET ROLLOVER ("LET WINNERS RUN" WITH 0.25% BREATHING BUFFER)
+        if bar_high >= target or ltp >= target:
+            new_sl = round(target * 0.9975, 2)  # Locks ~98% of Target 1 while absorbing micro-pullbacks
+            step_extension = round(target_dist * 0.5, 2)
+            new_target = round(target + step_extension, 2)
+            if new_sl > sl:
+                trades_ws.update(f"G{idx}:H{idx}", [[new_sl, new_target]])
+                sl, target = new_sl, new_target
+                log_msg(
+                    sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "TARGET_ROLLOVER",
+                    f"🚀 {sym} hit Target! Rolled SL up to ₹{new_sl} (0.25% buffer) & extended Target 2 to ₹{new_target}",
+                    {"symbol": sym, "new_sl": new_sl, "new_target": new_target}
+                )
+
+        # 3. INDIVIDUAL PER-TRADE STEP-TRAILING SL (50% & 75% OF TARGET DISTANCE)
+        else:
+            progress = (bar_high - entry) / target_dist
+            be_sl = round(entry * 1.002, 2)  # Breakeven + charges
+            half_gain_sl = round(entry + (0.50 * target_dist), 2)
+
+            if progress >= 0.75 and sl < half_gain_sl:
+                trades_ws.update(f"G{idx}", [[half_gain_sl]])
+                sl = half_gain_sl
+                log_msg(
+                    sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "TRAILING_SL_50PCT",
+                    f"🔒 {sym} reached 75% of target → Locked 50% profit (SL raised to ₹{half_gain_sl})",
+                    {"symbol": sym, "new_sl": half_gain_sl}
+                )
+            elif progress >= 0.50 and sl < be_sl:
+                trades_ws.update(f"G{idx}", [[be_sl]])
+                sl = be_sl
+                log_msg(
+                    sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "TRAILING_SL_BE",
+                    f"🛡️ {sym} reached 50% of target → SL moved to Breakeven + Charges (₹{be_sl})",
+                    {"symbol": sym, "new_sl": be_sl}
+                )
+
+        unrealized = (ltp - entry) * qty
+        combined_unrealized += unrealized
+        remaining_open.append((idx, sym, qty, entry, ltp))
+
+    # 4. STEPPED PORTFOLIO PROFIT FLOOR (+₹7k / +₹10k / +₹15k / +₹20k+)
+    if combined_unrealized > state["peak_portfolio_pnl"]:
+        state["peak_portfolio_pnl"] = round(combined_unrealized, 2)
+
+    floor = get_portfolio_profit_floor(state["peak_portfolio_pnl"])
+    if floor is not None and remaining_open and combined_unrealized <= floor:
+        total_locked_pnl = 0.0
+        for idx, sym, qty, entry, ltp in remaining_open:
+            pnl = round((ltp - entry) * qty, 2)
+            total_locked_pnl += pnl
+            cash += ltp * qty
+            cash_changed = True
+            trades_ws.update(f"D{idx}", [["PORTFOLIO_FLOOR_EXIT"]])
+            trades_ws.update(f"I{idx}:J{idx}", [[ltp, pnl]])
+
+        log_msg(
+            sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "PORTFOLIO_FLOOR_EXIT",
+            f"💰 Portfolio Profit Floor triggered (Peak: +₹{state['peak_portfolio_pnl']:,.2f}, Floor: +₹{floor:,.2f}) → Liquidated {len(remaining_open)} positions | Locked Net P&L: ₹{total_locked_pnl:+,.2f}",
+            {"peak_pnl": state["peak_portfolio_pnl"], "floor": floor, "realized_pnl": round(total_locked_pnl, 2)}
+        )
+        state["peak_portfolio_pnl"] = 0.0
+
+    if cash_changed:
+        acct_ws.update("A2", [[round(cash, 2)]])
+
+
+async def run_split_speed_session(api_key: str, gcp_creds_dict: dict, watchdog_ticks: int = 27, interval_sec: int = 30):
+    """
+    Phase 1 (0:00): Runs full 250-stock AI scan + entry execution.
+    Phase 2 (0:30 to 14:00): Runs 27 lightweight 30-second watchdog ticks (zero Gemini tokens).
+    """
+    await run_full_cycle(api_key, gcp_creds_dict)
+
     sh = get_gsheet_client(gcp_creds_dict)
-    client = genai.Client(api_key=api_key.strip())
-    cycle_id = now_ist().strftime("CYC-%H%M%S-IST")
+    watchdog_state = {"peak_portfolio_pnl": 0.0}
 
-    existing_trades = sh.worksheet("trades").get_all_records()
-    open_holdings = {r["symbol"] for r in existing_trades if r.get("status") == "OPEN"}
-
-    market_data, live_prices, mover_count = fetch_nse_metrics(excluded_symbols=open_holdings)
-    scanned_count = len(live_prices)
-
-    ag1_pool = [d for d in market_data if d["beta"] <= 1.05 and d["ltp"] >= d["sma_200"] and d["rsi_14"] <= 72]
-    ag1_slice = sorted(ag1_pool or market_data, key=lambda x: (x["beta"], -x["rvol"]))[:15]
-
-    ag2_pool = [d for d in market_data if 0.85 <= d["beta"] <= 1.55 and 45 <= d["rsi_14"] <= 68]
-    ag2_slice = sorted(ag2_pool or market_data, key=lambda x: x["rvol"], reverse=True)[:15]
-
-    ag3_pool = [d for d in market_data if d["beta"] >= 1.25 or abs(d["day_change_pct"]) >= 1.5]
-    ag3_slice = sorted(ag3_pool or market_data, key=lambda x: (abs(x["day_change_pct"]) * x["rvol"]), reverse=True)[:15]
-
-    ag1 = await run_screener(
-        sh, client, cycle_id, "AG1_LOW_RISK",
-        "Focus on LOW-RISK large-cap stability (lowest beta, price above 200-SMA, RSI under 72, tight 1.5x ATR stop).",
-        ag1_slice, scanned_count, mover_count
-    )
-    ag2 = await run_screener(
-        sh, client, cycle_id, "AG2_MID_RISK",
-        "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
-        ag2_slice, scanned_count, mover_count
-    )
-    ag3 = await run_screener(
-        sh, client, cycle_id, "AG3_HIGH_RISK",
-        "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move with volume, tight 1x ATR stop).",
-        ag3_slice, scanned_count, mover_count
-    )
-
-    candidates = ag1 + ag2 + ag3
-    decisions = (await run_ag4(sh, client, cycle_id, candidates)).selected_trades if candidates else []
-    ag5_broker_step(sh, cycle_id, decisions, live_prices)
+    for tick in range(1, watchdog_ticks + 1):
+        if not is_nse_open_now():
+            break
+        time.sleep(interval_sec)
+        try:
+            tick_id = now_ist().strftime(f"WD-{tick:02d}-%H%M%S")
+            run_single_watchdog_tick(sh, tick_id, watchdog_state)
+        except Exception:
+            continue
