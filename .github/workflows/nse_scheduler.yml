@@ -1,14 +1,15 @@
-name: NSE 5-Agent Auto Trader (24/7 Cloud)
+name: NSE 5-Agent Split-Speed Auto Trader (24/7 Cloud)
 
 on:
   schedule:
-    # Runs every 15 minutes from 03:45 UTC to 10:00 UTC (09:15 AM to 03:30 PM IST), Monday to Friday
-    - cron: '*/15 3-10 * * 1-5'
+    # Off-peak minutes (7, 22, 37, 52) during 09:15 AM - 03:30 PM IST, Mon-Fri
+    - cron: '7,22,37,52 3-10 * * 1-5'
   workflow_dispatch:
 
 jobs:
   run-nse-agents:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,4 +20,4 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
         run: |
-          python -c "import asyncio, os, json; from engine import run_full_cycle; asyncio.run(run_full_cycle(os.environ['GEMINI_API_KEY'], json.loads(os.environ['GCP_SERVICE_ACCOUNT_JSON'])))"
+          python -c "import asyncio, os, json; from engine import run_split_speed_session; asyncio.run(run_split_speed_session(os.environ['GEMINI_API_KEY'], json.loads(os.environ['GCP_SERVICE_ACCOUNT_JSON']), watchdog_ticks=27, interval_sec=30))"
