@@ -6,7 +6,14 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
-from engine import run_full_cycle, get_gsheet_client, now_ist
+from engine import (
+    run_full_cycle,
+    get_gsheet_client,
+    now_ist,
+    compute_agent_trust_scores,
+    infer_trade_agent,
+    record_trade_reflection,
+)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -31,18 +38,20 @@ st.markdown("""
     .platform-title { font-size: 21px; font-weight: 800; color: #f8fafc; margin: 0; }
     .top-ticker-strip { margin-left: 14px; color: #94a3b8; font-size: 13px; }
     .live-pill { background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; color: #34d399; padding: 4px 12px; border-radius: 20px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
-    .wf-card { border-radius: 12px; padding: 14px 10px; text-align: center; background: #0b1426; min-height: 130px; }
+    .wf-card { border-radius: 12px; padding: 14px 10px; text-align: center; background: #0b1426; min-height: 148px; }
     .wf-green { border: 1.5px solid #10b981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.22); }
     .wf-blue  { border: 1.5px solid #3b82f6; box-shadow: 0 0 15px rgba(59, 130, 246, 0.22); }
     .wf-orange{ border: 1.5px solid #f97316; box-shadow: 0 0 15px rgba(249, 115, 22, 0.22); }
     .wf-purple{ border: 1.5px solid #a855f7; box-shadow: 0 0 15px rgba(168, 85, 247, 0.22); }
     .wf-teal  { border: 1.5px solid #06b6d4; box-shadow: 0 0 15px rgba(6, 182, 212, 0.22); }
     .wf-title { font-size: 17px; font-weight: 800; color: #ffffff; margin: 4px 0; }
-    .wf-sub   { font-size: 11.5px; color: #94a3b8; margin-bottom: 6px; }
+    .wf-sub   { font-size: 11.5px; color: #94a3b8; margin-bottom: 4px; }
     .wf-stat  { font-size: 12px; font-weight: 600; color: #34d399; }
-    .wf-arrow { text-align: center; padding-top: 50px; font-size: 22px; color: #64748b; }
+    .trust-pill { display: inline-block; margin-top: 5px; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; background: #132342; color: #38bdf8; border: 1px solid #1e3a5f; }
+    .wf-arrow { text-align: center; padding-top: 56px; font-size: 22px; color: #64748b; }
     .agent-col { background: #0b1324; border: 1px solid #1e293b; border-radius: 12px; padding: 12px; min-height: 290px; }
     .chat-bubble { background: #131f38; border-left: 3px solid #38bdf8; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-size: 12.5px; color: #e2e8f0; }
+    .lesson-card { background: #111b33; border-left: 3px solid #f59e0b; border-radius: 8px; padding: 9px 12px; margin-bottom: 8px; font-size: 12.5px; color: #e2e8f0; }
     .chat-time { font-size: 10.5px; color: #64748b; display: block; margin-bottom: 2px; }
     .panel-box { background: #0b1324; border: 1px solid #1e293b; border-radius: 12px; padding: 16px; }
     .rec-ticker { font-size: 24px; font-weight: 800; color: #34d399; letter-spacing: 0.5px; }
@@ -63,7 +72,7 @@ st.markdown("""
         color: #ffffff;
     }
 
-    /* MOBILE PHONE ADAPTATIONS (≤ 768px) */
+    /* MOBILE PHONE ADAPTATIONS (<= 768px) */
     @media (max-width: 768px) {
         .block-container { padding-top: 1rem !important; padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
         .top-bar { flex-direction: column; align-items: flex-start; gap: 8px; padding: 12px 14px; }
@@ -129,6 +138,16 @@ def get_stock_chart_data(symbol: str, period: str, interval: str) -> pd.DataFram
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=180)
+def get_nifty_benchmark_series(start_date_str: str) -> pd.DataFrame:
+    try:
+        start_dt = pd.to_datetime(start_date_str) - timedelta(days=2)
+        df = yf.Ticker("^NSEI").history(start=start_dt.strftime("%Y-%m-%d"), interval="1d")
+        return df.dropna()
+    except Exception:
+        return pd.DataFrame()
+
+
 def is_nse_market_open(now_dt: datetime) -> bool:
     if now_dt.weekday() >= 5:
         return False
@@ -154,8 +173,10 @@ cash = float(sh.worksheet("account").acell("A2").value or 1_000_000.0)
 trades_records = sh.worksheet("trades").get_all_records()
 msgs_records = sh.worksheet("agent_messages").get_all_records()
 
+trust_scores = compute_agent_trust_scores(trades_records)
+
 trades_df = pd.DataFrame(trades_records).iloc[::-1] if trades_records else pd.DataFrame()
-msgs_df = pd.DataFrame(msgs_records).iloc[::-1].head(120) if msgs_records else pd.DataFrame()
+msgs_df = pd.DataFrame(msgs_records).iloc[::-1].head(150) if msgs_records else pd.DataFrame()
 
 open_t = trades_df[trades_df["status"] == "OPEN"].copy() if not trades_df.empty else pd.DataFrame()
 closed_t = trades_df[trades_df["status"] != "OPEN"].copy() if not trades_df.empty else pd.DataFrame()
@@ -197,8 +218,8 @@ st.markdown(f"""
     <div>
         <span class="platform-title">5-Agent Intelligent Stock Trading Platform</span>
         <span class="top-ticker-strip">
-            <b>NIFTY 50</b> {nifty_val:,.2f} <span style="color:#34d399;">({nifty_pct:+.2f}%)</span>  | 
-            <b>SENSEX</b> {sensex_val:,.2f} <span style="color:#34d399;">({sensex_pct:+.2f}%)</span>  | 
+            <b>NIFTY 50</b> {nifty_val:,.2f} <span style="color:#34d399;">({nifty_pct:+.2f}%)</span> &nbsp;|&nbsp;
+            <b>SENSEX</b> {sensex_val:,.2f} <span style="color:#34d399;">({sensex_pct:+.2f}%)</span> &nbsp;|&nbsp;
             <b>Equity:</b> <span style="color:#f8fafc;">₹{total_portfolio:,.2f}</span>
         </span>
     </div>
@@ -209,7 +230,7 @@ st.markdown(f"""
 ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.4, 1.1, 1.3, 2.2])
 with ctrl1:
     if st.button("⚡ Run 5-Agent Cycle Now", use_container_width=True, type="primary"):
-        with st.spinner("Scanning 250 NSE stocks + live movers → AG1–AG5 executing..."):
+        with st.spinner("Scanning 250 NSE stocks + Trust-weighted AG1–AG5 executing..."):
             asyncio.run(run_full_cycle(api_key, gcp_creds))
         st.cache_data.clear()
         st.toast("250-Stock Cycle Completed!", icon="✅")
@@ -223,7 +244,7 @@ with ctrl3:
 with ctrl4:
     st.markdown(
         f"<div class='status-strip'>"
-        f"📅 {current_ist.strftime('%d %b %Y (%a)')}  |  Cash: <b style='color:#f8fafc;'>₹{cash:,.2f}</b>  |  "
+        f"📅 {current_ist.strftime('%d %b %Y (%a)')} &nbsp;|&nbsp; Cash: <b style='color:#f8fafc;'>₹{cash:,.2f}</b> &nbsp;|&nbsp; "
         f"Unrealized P&L: <b style='color:{'#34d399' if unrealized_pnl_total >= 0 else '#f87171'};'>₹{unrealized_pnl_total:+,.2f}</b>"
         f"</div>",
         unsafe_allow_html=True,
@@ -241,48 +262,128 @@ ag2_msgs = get_agent_msgs("AG2_MID_RISK", 3)
 ag3_msgs = get_agent_msgs("AG3_HIGH_RISK", 3)
 ag4_msgs = get_agent_msgs("AG4_CHIEF_ANALYST", 3)
 ag5_msgs = get_agent_msgs("AG5_EXECUTION_BROKER", 3)
+lesson_msgs = msgs_df[msgs_df["msg_type"] == "AGENT_LESSON"].head(6).to_dict("records") if not msgs_df.empty else []
 
 tab_dash, tab_charts, tab_port, tab_agents, tab_logs = st.tabs([
     "🏠 Command Center",
     "📈 Live Charts",
     "💼 Portfolio & P&L",
-    "🤖 Agents",
+    "🤖 Agents & Trust",
     "📜 Ledger",
 ])
 
 with tab_dash:
     top_left, top_right = st.columns([3.3, 1.3])
     with top_left:
-        st.markdown("#### ⚡ 5-Agent Workflow & Communication Flow (24/7 Cloud)")
+        st.markdown("#### ⚡ 5-Agent Workflow & Trust Standings (24/7 Cloud)")
         w1, a1, w2, a2, w3, a3, w4, a4, w5 = st.columns([1.8, 0.3, 1.8, 0.3, 1.8, 0.3, 2.0, 0.3, 1.8])
+        t1 = trust_scores["AG1_LOW_RISK"]["score"]
+        t2 = trust_scores["AG2_MID_RISK"]["score"]
+        t3 = trust_scores["AG3_HIGH_RISK"]["score"]
         with w1:
-            st.markdown(f"<div class='wf-card wf-green'><div style='font-size:22px;'>🛡️</div><div class='wf-title'>AG1</div><div class='wf-sub'>Low Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag1_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='wf-card wf-green'><div style='font-size:20px;'>🛡️</div><div class='wf-title'>AG1</div><div class='wf-sub'>Low Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag1_msgs else 'Standby'}</div><span class='trust-pill'>Trust {t1}/100</span></div>", unsafe_allow_html=True)
         with a1:
             st.markdown("<div class='wf-arrow'>→</div>", unsafe_allow_html=True)
         with w2:
-            st.markdown(f"<div class='wf-card wf-blue'><div style='font-size:22px;'>📈</div><div class='wf-title'>AG2</div><div class='wf-sub'>Mid Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag2_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='wf-card wf-blue'><div style='font-size:20px;'>📈</div><div class='wf-title'>AG2</div><div class='wf-sub'>Mid Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag2_msgs else 'Standby'}</div><span class='trust-pill'>Trust {t2}/100</span></div>", unsafe_allow_html=True)
         with a2:
             st.markdown("<div class='wf-arrow'>→</div>", unsafe_allow_html=True)
         with w3:
-            st.markdown(f"<div class='wf-card wf-orange'><div style='font-size:22px;'>🚀</div><div class='wf-title'>AG3</div><div class='wf-sub'>High Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag3_msgs else 'Standby'}</div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='wf-card wf-orange'><div style='font-size:20px;'>🚀</div><div class='wf-title'>AG3</div><div class='wf-sub'>High Risk Analyst</div><div class='wf-stat'>✓ {'Active' if ag3_msgs else 'Standby'}</div><span class='trust-pill'>Trust {t3}/100</span></div>", unsafe_allow_html=True)
         with a3:
             st.markdown("<div class='wf-arrow' style='color:#a855f7;'>⇉</div>", unsafe_allow_html=True)
         with w4:
-            st.markdown(f"<div class='wf-card wf-purple'><div style='font-size:22px;'>🧠</div><div class='wf-title'>AG4</div><div class='wf-sub'>Final Analysis & Selection</div><div class='wf-stat'>✓ {'Verified' if ag4_msgs else 'Waiting'}</div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='wf-card wf-purple'><div style='font-size:20px;'>🧠</div><div class='wf-title'>AG4</div><div class='wf-sub'>Chief Analyst</div><div class='wf-stat'>✓ {'Verified' if ag4_msgs else 'Waiting'}</div><span class='trust-pill'>Trust-Weighted</span></div>", unsafe_allow_html=True)
         with a4:
             st.markdown("<div class='wf-arrow' style='color:#06b6d4;'>→</div>", unsafe_allow_html=True)
         with w5:
-            st.markdown(f"<div class='wf-card wf-teal'><div style='font-size:22px;'>🛒</div><div class='wf-title'>AG5</div><div class='wf-sub'>Execute Trades</div><div class='wf-stat'>✓ {len(open_t)} Open</div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='wf-card wf-teal'><div style='font-size:20px;'>🛒</div><div class='wf-title'>AG5</div><div class='wf-sub'>Execute & Watchdog</div><div class='wf-stat'>✓ {len(open_t)}/10 Open</div><span class='trust-pill'>25%+10% Ladder</span></div>", unsafe_allow_html=True)
 
     with top_right:
         st.markdown("#### 📊 Live Market Snapshot")
         st.markdown(f"""
-        <div class="panel-box" style="min-height:130px;padding:12px;">
-            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;"><span style="color:#94a3b8;">NIFTY 50</span><span><b>{nifty_val:,.2f}</b> <span style="color:#34d399;">{nifty_pct:+.2f}%</span></span></div>
-            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;"><span style="color:#94a3b8;">SENSEX</span><span><b>{sensex_val:,.2f}</b> <span style="color:#34d399;">{sensex_pct:+.2f}%</span></span></div>
+        <div class="panel-box" style="min-height:148px;padding:12px;">
+            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:8px;"><span style="color:#94a3b8;">NIFTY 50</span><span><b>{nifty_val:,.2f}</b> <span style="color:#34d399;">{nifty_pct:+.2f}%</span></span></div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:8px;"><span style="color:#94a3b8;">SENSEX</span><span><b>{sensex_val:,.2f}</b> <span style="color:#34d399;">{sensex_pct:+.2f}%</span></span></div>
             <div style="display:flex;justify-content:space-between;font-size:13px;"><span style="color:#94a3b8;">BANK NIFTY</span><span><b>{bnifty_val:,.2f}</b> <span style="color:#34d399;">{bnifty_pct:+.2f}%</span></span></div>
         </div>
         """, unsafe_allow_html=True)
+
+    # --- BENCHMARK CURVE (PORTFOLIO EQUITY VS NIFTY 50) + WHAT THEY HAVE LEARNED ---
+    st.markdown("<br>", unsafe_allow_html=True)
+    bench_col, learn_col = st.columns([1.8, 1.2])
+    with bench_col:
+        st.markdown("#### 📈 Portfolio Equity vs. NIFTY 50 Benchmark (₹10,00,000 Base)")
+        if trades_records:
+            chron_trades = pd.DataFrame(trades_records)
+            chron_trades["dt"] = pd.to_datetime(chron_trades["timestamp"].str.replace(" IST", "", regex=False), errors="coerce")
+            chron_trades = chron_trades.dropna(subset=["dt"]).sort_values("dt")
+            start_str = chron_trades["dt"].min().strftime("%Y-%m-%d")
+            nifty_hist = get_nifty_benchmark_series(start_str)
+
+            eq_dates = [chron_trades["dt"].min() - timedelta(hours=1)]
+            eq_vals = [1_000_000.0]
+            running_realized = 0.0
+            for _, tr in chron_trades.iterrows():
+                if tr.get("status") != "OPEN":
+                    running_realized += float(tr.get("pnl", 0) or 0)
+                    eq_dates.append(tr["dt"])
+                    eq_vals.append(1_000_000.0 + running_realized)
+            eq_dates.append(current_ist.replace(tzinfo=None))
+            eq_vals.append(total_portfolio)
+
+            fig_bench = go.Figure()
+            fig_bench.add_trace(go.Scatter(
+                x=eq_dates,
+                y=eq_vals,
+                mode="lines+markers",
+                name="5-Agent Portfolio (₹)",
+                line=dict(color="#10b981", width=3),
+                marker=dict(size=6),
+            ))
+
+            if not nifty_hist.empty:
+                n_idx = nifty_hist.index.tz_localize(None)
+                base_nifty = float(nifty_hist["Close"].iloc[0])
+                scaled_nifty = (nifty_hist["Close"] / base_nifty) * 1_000_000.0
+                fig_bench.add_trace(go.Scatter(
+                    x=n_idx,
+                    y=scaled_nifty,
+                    mode="lines",
+                    name="NIFTY 50 Buy & Hold (₹10L Eq.)",
+                    line=dict(color="#94a3b8", width=2, dash="dash"),
+                ))
+
+            fig_bench.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="#0b1324",
+                plot_bgcolor="#081020",
+                height=265,
+                margin=dict(l=10, r=10, t=14, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                yaxis_title="Account Value (₹)",
+            )
+            st.plotly_chart(fig_bench, use_container_width=True)
+        else:
+            st.markdown("<div class='panel-box' style='min-height:265px;'><p style='color:#94a3b8;'>Run your first cycle to begin plotting Portfolio vs. NIFTY 50 benchmark performance.</p></div>", unsafe_allow_html=True)
+
+    with learn_col:
+        st.markdown("#### 🧠 What They Have Learned (Self-Reflection Feed)")
+        if not lesson_msgs:
+            st.markdown(
+                "<div class='panel-box' style='min-height:265px;'>"
+                "<div class='lesson-card'>🤖 <b>Self-Reflection Engine Armed:</b> Whenever any trade closes in profit or loss, the responsible agent records a 1-line post-mortem lesson here and updates its Trust Score (0–100) for future cycles.</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            lessons_html = "<div class='panel-box' style='min-height:265px;max-height:265px;overflow-y:auto;'>"
+            for lm in lesson_msgs[:4]:
+                ts_parts = str(lm.get("timestamp", "")).split(" ")
+                ts_short = " ".join(ts_parts[1:]) if len(ts_parts) > 1 else str(lm.get("timestamp", ""))
+                lessons_html += f"<div class='lesson-card'><span class='chat-time'>🎓 {ts_short}</span>{lm['summary']}</div>"
+            lessons_html += "</div>"
+            st.markdown(lessons_html, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("#### 💬 Agent Communication — Live Chat Stream (IST)")
@@ -310,11 +411,11 @@ with tab_dash:
                 unsafe_allow_html=True,
             )
 
-    render_agent_column(c_ag1, "🛡️ AG1 – Low Risk", "#10b981", ag1_msgs, "Scanning low-beta NIFTY 200 large caps...")
-    render_agent_column(c_ag2, "📈 AG2 – Mid Risk", "#3b82f6", ag2_msgs, "Scanning momentum & RVOL breakouts...")
+    render_agent_column(c_ag1, "🛡️ AG1 – Low Risk", "#10b981", ag1_msgs, "Scanning low-beta NIFTY 200 + VWAP...")
+    render_agent_column(c_ag2, "📈 AG2 – Mid Risk", "#3b82f6", ag2_msgs, "Scanning momentum & RVOL + VWAP...")
     render_agent_column(c_ag3, "🚀 AG3 – High Risk", "#f97316", ag3_msgs, "Scanning high-beta intraday movers...")
-    render_agent_column(c_ag4, "🧠 AG4 – Chief Analyst", "#a855f7", ag4_msgs, "Awaiting proposals + news sentiment audit...")
-    render_agent_column(c_ag5, "⚡ AG5 – Executor", "#06b6d4", ag5_msgs, "Monitoring bracket orders & SL/TP...")
+    render_agent_column(c_ag4, "🧠 AG4 – Chief Analyst", "#a855f7", ag4_msgs, "Auditing trust weights, news & regime...")
+    render_agent_column(c_ag5, "⚡ AG5 – Executor", "#06b6d4", ag5_msgs, "30s Watchdog & 25%+10% Ladder active...")
 
     st.markdown("<br>", unsafe_allow_html=True)
     b1, b2, b3 = st.columns([1.2, 1.3, 1.5])
@@ -331,10 +432,11 @@ with tab_dash:
                 pass
         if latest_buy:
             rr_val = round((latest_buy["target_price"] - latest_buy["entry_price"]) / max(latest_buy["entry_price"] - latest_buy["stop_loss"], 0.01), 1)
+            src_ag = latest_buy.get("source_agent", "AG4")
             st.markdown(f"""
             <div class="panel-box" style="min-height:250px;">
                 <div class="rec-ticker">{latest_buy['symbol']}</div>
-                <div style="color:#94a3b8;font-size:12px;margin-bottom:10px;">Tier: <b>{latest_buy['risk_tier']}</b> • Conviction: <b>{latest_buy['conviction']}%</b></div>
+                <div style="color:#94a3b8;font-size:12px;margin-bottom:10px;">Tier: <b>{latest_buy['risk_tier']}</b> ({src_ag}) • Conviction: <b>{latest_buy['conviction']}%</b></div>
                 <div style="font-size:13px;line-height:1.8;">
                     <b>Entry Price:</b> ₹{latest_buy['entry_price']:,.2f}<br>
                     <b>Stop Loss:</b> <span style="color:#f87171;">₹{latest_buy['stop_loss']:,.2f}</span><br>
@@ -345,7 +447,7 @@ with tab_dash:
             </div>
             """, unsafe_allow_html=True)
         else:
-            st.markdown("<div class='panel-box' style='min-height:250px;'><div class='rec-ticker'>READY TO SCAN</div><p style='color:#94a3b8;font-size:13px;'>Scans 250 NSE stocks + live intraday movers every 15 mins during NSE hours.</p></div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel-box' style='min-height:250px;'><div class='rec-ticker'>WATCHDOG ACTIVE</div><p style='color:#94a3b8;font-size:13px;'>Monitoring 250 NSE stocks + 25%/10% step-trailing ladder & 3:45 PM EOD ATR recalibration.</p></div>", unsafe_allow_html=True)
 
     with b2:
         st.markdown("#### 💼 Portfolio & Live Equity")
@@ -366,7 +468,7 @@ with tab_dash:
             <div style="font-size:12.5px;color:#cbd5e1;line-height:1.9;border-top:1px solid #1e293b;padding-top:10px;">
                 <b>Available Cash:</b> ₹{cash:,.2f}<br>
                 <b>Invested Value (Live):</b> ₹{current_holdings_val:,.2f}<br>
-                <b>Active Positions:</b> {len(open_t)} NSE stocks
+                <b>Active Positions:</b> {len(open_t)} / 10 max slots
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -500,11 +602,12 @@ with tab_port:
                         entry_val = float(row["entry"])
                         pnl_val = round((exit_px - entry_val) * qty_val, 2)
                         new_cash = round(cash + exit_px * qty_val, 2)
+                        man_id = now_ist().strftime("MAN-%H%M%S-IST")
                         trades_ws.update(f"D{idx}", [["MANUAL_EXIT"]])
                         trades_ws.update(f"I{idx}:J{idx}", [[exit_px, pnl_val]])
                         acct_ws.update("A2", [[new_cash]])
                         sh.worksheet("agent_messages").append_row([
-                            now_ist().strftime("MAN-%H%M%S-IST"),
+                            man_id,
                             now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
                             "AG5_EXECUTION_BROKER",
                             "PORTFOLIO_LEDGER",
@@ -512,12 +615,39 @@ with tab_port:
                             f"MANUAL SELL {qty_val} {sym_to_close} @ ₹{exit_px} | Net P&L: ₹{pnl_val}",
                             json.dumps({"symbol": sym_to_close, "exit_price": exit_px, "pnl": pnl_val}),
                         ])
+                        ag = infer_trade_agent(row)
+                        new_scores = compute_agent_trust_scores(trades_ws.get_all_records())
+                        record_trade_reflection(
+                            sh,
+                            man_id,
+                            ag,
+                            sym_to_close,
+                            str(row.get("tier", "MID")),
+                            "MANUAL_EXIT",
+                            pnl_val,
+                            entry_val,
+                            exit_px,
+                            trust_scores.get(ag, {}).get("score", 50),
+                            new_scores.get(ag, {}).get("score", 50),
+                        )
                         break
                 st.cache_data.clear()
                 st.toast(f"Closed {sym_to_close}!", icon="✅")
                 st.rerun()
 
 with tab_agents:
+    st.markdown("#### 🏆 Agent Trust Leaderboard (0–100 ELO) & Self-Reflection Log")
+    tc1, tc2, tc3 = st.columns(3)
+    for col_obj, ag_key in zip([tc1, tc2, tc3], ["AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK"]):
+        info = trust_scores[ag_key]
+        with col_obj:
+            st.metric(
+                label=info["label"],
+                value=f"Trust: {info['score']} / 100",
+                delta=f"{info['wins']}W - {info['losses']}L | ₹{info['net_pnl']:+,.2f}",
+            )
+
+    st.divider()
     st.markdown("#### 🤖 Individual Agent Decision Inspector & JSON Payloads")
     a_tabs = st.tabs(["🛡️ AG1 (Low)", "📈 AG2 (Mid)", "🚀 AG3 (High)", "🧠 AG4 (Chief)", "⚡ AG5 (Broker)"])
     codes = ["AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK", "AG4_CHIEF_ANALYST", "AG5_EXECUTION_BROKER"]
