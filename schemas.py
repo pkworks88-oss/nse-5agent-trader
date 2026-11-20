@@ -1,10 +1,10 @@
 from pydantic import BaseModel, Field
-from typing import Literal, List
+from typing import Literal
 
 
 class StockSignal(BaseModel):
-    agent_id: Literal["AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK"]
-    symbol: str
+    agent_id: str
+    symbol: str = Field(..., description="NSE Yahoo ticker ending in .NS")
     ltp: float
     entry_price: float
     stop_loss: float
@@ -17,9 +17,10 @@ class StockSignal(BaseModel):
 
 class FinalDecision(BaseModel):
     symbol: str
+    source_agent: Literal["AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK"]
     risk_tier: Literal["LOW", "MID", "HIGH"]
     action: Literal["BUY", "SKIP"]
-    conviction: int = Field(ge=1, le=100)
+    conviction: int = Field(..., ge=0, le=100)
     entry_price: float
     stop_loss: float
     target_price: float
@@ -28,4 +29,4 @@ class FinalDecision(BaseModel):
 
 
 class CommitteeOutput(BaseModel):
-    selected_trades: List[FinalDecision]
+    selected_trades: list[FinalDecision]
