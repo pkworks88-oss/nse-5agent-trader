@@ -233,6 +233,8 @@ sigma = max(0.11, min(0.35, india_vix / 100.0))
 nifty_spot_live = float(fno_ctx.get("indices", {}).get("NIFTY", {}).get("spot", 25500.0))
 bnifty_spot_live = float(fno_ctx.get("indices", {}).get("BANKNIFTY", {}).get("spot", 63300.0))
 
+cas_mode_ui = st.sidebar.toggle("📅 NSE Dec 7, 2026 CAS Schedule", value=CAS_DEC7_2026_ENABLED, key="cas_dec7_toggle")
+_ie.CAS_DEC7_2026_ENABLED = bool(cas_mode_ui)
 sq_btn_lbl = "⏰ Force 3:25 PM (CAS) Square-Off" if cas_mode_ui else "⏰ Force 3:15 PM EOD Square-Off"
 st.markdown("## ⚡ Desk 2: ₹2,00,000 Unified Intraday Equity MIS & Index F&O Terminal (V4.7)")
 
@@ -257,8 +259,6 @@ with b4:
     st.markdown(f"<div style='text-align:right;padding-top:6px;font-size:12.5px;color:#94a3b8;'>Peak: <b>₹{peak_pnl:+,.0f}</b> | Floor: <b>₹{locked_floor:+,.0f}</b></div>", unsafe_allow_html=True)
 
 mins_now = current_ist.hour * 60 + current_ist.minute
-cas_mode_ui = st.sidebar.toggle("📅 NSE Dec 7, 2026 CAS Schedule", value=CAS_DEC7_2026_ENABLED, key="cas_dec7_toggle")
-_ie.CAS_DEC7_2026_ENABLED = bool(cas_mode_ui)
 sq_cutoff_min = (15 * 60 + 25) if cas_mode_ui else (15 * 60 + 15)
 sq_lbl = "3:25 PM (Dec 7 CAS)" if cas_mode_ui else "3:15 PM IST"
 
