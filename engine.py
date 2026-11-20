@@ -24,6 +24,7 @@ SHEET_NAME = "NSE_5Agent_Ledger"
 # --- PORTFOLIO & RISK GUARDRAILS ---
 MAX_OPEN_POSITIONS = 10
 RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
+ATR_MULT_PER_TIER = {"LOW": 1.5, "MID": 2.0, "HIGH": 1.0}
 
 SECTOR_INDICES = {
     "BANK": "^NSEBANK",
@@ -88,7 +89,8 @@ def is_nse_open_now() -> bool:
 def get_gsheet_client(gcp_creds_dict: dict):
     creds_copy = dict(gcp_creds_dict)
     if "private_key" in creds_copy:
-        creds_copy["private_key"] = creds_copy["private_key"].replace("\\n", "\n")
+        creds_copy["private_key"] = creds_copy["private_key"].replace("\n", "
+")
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -115,7 +117,6 @@ def log_msg(sh, cycle_id: str, sender: str, recipient: str, msg_type: str, summa
 # SKILL 1 & 2: NIFTY 50 MARKET REGIME + SECTOR STRENGTH + CLOSED-TRADE MEMORY
 # ==============================================================================
 def get_market_regime_and_sectors() -> dict:
-    """Checks NIFTY 50 trend/day change and ranks top NSE sector indices."""
     tickers = ["^NSEI"] + list(SECTOR_INDICES.values())
     regime = {
         "nifty_chg_pct": 0.0,
@@ -152,7 +153,6 @@ def get_market_regime_and_sectors() -> dict:
 
 
 def build_trade_memory_scorecard(trades_records: list[dict]) -> str:
-    """Skill: Summarizes recent closed trade performance by tier so AG4 adapts dynamically."""
     closed = [r for r in trades_records if r.get("status") not in ("OPEN", "", None)]
     if not closed:
         return "No closed trades yet; enforce strict R:R >= 1:1.6 and clean news."
@@ -172,7 +172,6 @@ def build_trade_memory_scorecard(trades_records: list[dict]) -> str:
 # SKILL 3 & 4: 15-MIN INTRADAY VWAP CONFIRMATION + 48H EARNINGS BLACKOUT
 # ==============================================================================
 def enrich_with_intraday_vwap(candidates: list[dict]) -> list[dict]:
-    """Verifies top finalists are trading above intraday VWAP (institutional support)."""
     if not candidates:
         return candidates
     syms = list({c["symbol"] for c in candidates})
@@ -199,7 +198,6 @@ def enrich_with_intraday_vwap(candidates: list[dict]) -> list[dict]:
 
 
 def has_upcoming_earnings_48h(symbol: str) -> bool:
-    """Skill: Blocks new entries if quarterly earnings are within 48 hours."""
     try:
         cal = yf.Ticker(symbol).calendar
         if isinstance(cal, dict) and "Earnings Date" in cal:
@@ -423,7 +421,7 @@ async def run_screener(
 
     mover_note = f" ({mover_count} live movers)" if mover_count > 0 else ""
     summary = (
-        f"Scanned {scanned_count} NSE stocks{mover_note} → Sent {len(signals)} to AG4{mode_tag}: "
+        f"Scanned {scanned_count} NSE stocks{mover_note} -> Sent {len(signals)} to AG4{mode_tag}: "
         + ", ".join([f"{s.symbol} @ ₹{s.entry_price}" for s in signals])
         if signals
         else "No setups approved."
@@ -560,7 +558,6 @@ async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
     candidates = ag1 + ag2 + ag3
     decisions = (await run_ag4(sh, client, cycle_id, candidates, regime, memory_scorecard)).selected_trades if candidates else []
 
-    # Execute approved BUY orders respecting MAX_OPEN_POSITIONS = 10
     acct_ws = sh.worksheet("account")
     trades_ws = sh.worksheet("trades")
     cash = float(acct_ws.acell("A2").value or 1_000_000.0)
@@ -592,10 +589,9 @@ async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
 
 
 # ==============================================================================
-# PHASE 2: HIGH-FREQUENCY 30s WATCHDOG + TWO-TIER PROFIT LOCK + TARGET ROLLOVER
+# PHASE 2: HIGH-FREQUENCY 30s WATCHDOG + 25%/10% TRAILING LADDER + ROLLOVER
 # ==============================================================================
 def fetch_1m_candles_for_open(symbols: list[str]) -> dict[str, dict]:
-    """Fetches latest 1-minute High, Low, Close for open holdings only (fast, zero Gemini tokens)."""
     quotes = {}
     if not symbols:
         return quotes
@@ -618,10 +614,32 @@ def fetch_1m_candles_for_open(symbols: list[str]) -> dict[str, dict]:
     return quotes
 
 
+def compute_25_plus_10_ladder_sl(entry: float, target_dist: float, progress: float) -> tuple[float | None, str]:
+    if progress < 0.25:
+        return None, ""
+
+    if progress >= 0.95:
+        lock_pct = 0.80
+        label = "95% Target -> Locked 80% Gain"
+    elif progress >= 0.85:
+        lock_pct = 0.65
+        label = "85% Target -> Locked 65% Gain"
+    else:
+        step_idx = int((progress - 0.25 + 1e-9) // 0.10)
+        step_idx = min(step_idx, 5)
+        if step_idx == 0:
+            return round(entry * 1.002, 2), "25% Target -> Breakeven + Charges"
+        lock_pct = round(step_idx * 0.10, 2)
+        milestone_pct = 25 + (step_idx * 10)
+        label = f"{milestone_pct}% Target -> Locked {int(lock_pct * 100)}% Gain"
+
+    candidate_sl = round(entry + (lock_pct * target_dist), 2)
+    return candidate_sl, label
+
+
 def get_portfolio_profit_floor(peak_pnl: float) -> float | None:
-    """Stepped Portfolio Profit Floor starting at +₹7,000 for ₹10L equity wallet."""
     if peak_pnl >= 20_000:
-        return round(peak_pnl * 0.75, 2)  # Dynamic 75% ratchet (locks >= +₹15,000)
+        return round(peak_pnl * 0.75, 2)
     elif peak_pnl >= 15_000:
         return 10_500.0
     elif peak_pnl >= 10_000:
@@ -632,13 +650,6 @@ def get_portfolio_profit_floor(peak_pnl: float) -> float | None:
 
 
 def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
-    """
-    Evaluates open positions using 1m wicks:
-    1. Stop-Loss Hit -> Closes trade (SL_HIT or TRAILING_SL_HIT).
-    2. Target Hit -> Rollover! Moves SL to old_target * 0.9975 (0.25% buffer) and extends Target by +1R.
-    3. Step-Trailing SL -> At 50% target moves SL to entry*1.002; at 75% target locks 50% of gain.
-    4. Stepped Portfolio Floor -> +₹7k / +₹10k / +₹15k / +₹20k+ basket profit protection.
-    """
     if state is None:
         state = {"peak_portfolio_pnl": 0.0}
 
@@ -673,7 +684,7 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
         qty = int(row["qty"])
         target_dist = max(target - entry, entry * 0.01)
 
-        # 1. CHECK STOP-LOSS HIT (1-minute wick low or live LTP <= SL)
+        # 1. STOP-LOSS CHECK
         if bar_low <= sl or ltp <= sl:
             exit_px = round(min(ltp, sl) if bar_low <= sl else ltp, 2)
             pnl = round((exit_px - entry) * qty, 2)
@@ -689,9 +700,9 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
             )
             continue
 
-        # 2. TARGET ROLLOVER ("LET WINNERS RUN" WITH 0.25% BREATHING BUFFER)
+        # 2. TARGET ROLLOVER (0.25% BREATHING BUFFER + TARGET 2 EXTENSION)
         if bar_high >= target or ltp >= target:
-            new_sl = round(target * 0.9975, 2)  # Locks ~98% of Target 1 while absorbing micro-pullbacks
+            new_sl = round(target * 0.9975, 2)
             step_extension = round(target_dist * 0.5, 2)
             new_target = round(target + step_extension, 2)
             if new_sl > sl:
@@ -702,28 +713,17 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
                     f"🚀 {sym} hit Target! Rolled SL up to ₹{new_sl} (0.25% buffer) & extended Target 2 to ₹{new_target}",
                     {"symbol": sym, "new_sl": new_sl, "new_target": new_target}
                 )
-
-        # 3. INDIVIDUAL PER-TRADE STEP-TRAILING SL (50% & 75% OF TARGET DISTANCE)
+        # 3. 25% BREAKEVEN + 10% INCREMENTAL STEP-TRAILING LADDER
         else:
             progress = (bar_high - entry) / target_dist
-            be_sl = round(entry * 1.002, 2)  # Breakeven + charges
-            half_gain_sl = round(entry + (0.50 * target_dist), 2)
-
-            if progress >= 0.75 and sl < half_gain_sl:
-                trades_ws.update(f"G{idx}", [[half_gain_sl]])
-                sl = half_gain_sl
+            ladder_sl, ladder_label = compute_25_plus_10_ladder_sl(entry, target_dist, progress)
+            if ladder_sl is not None and ladder_sl > sl:
+                trades_ws.update(f"G{idx}", [[ladder_sl]])
+                sl = ladder_sl
                 log_msg(
-                    sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "TRAILING_SL_50PCT",
-                    f"🔒 {sym} reached 75% of target → Locked 50% profit (SL raised to ₹{half_gain_sl})",
-                    {"symbol": sym, "new_sl": half_gain_sl}
-                )
-            elif progress >= 0.50 and sl < be_sl:
-                trades_ws.update(f"G{idx}", [[be_sl]])
-                sl = be_sl
-                log_msg(
-                    sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "TRAILING_SL_BE",
-                    f"🛡️ {sym} reached 50% of target → SL moved to Breakeven + Charges (₹{be_sl})",
-                    {"symbol": sym, "new_sl": be_sl}
+                    sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "TRAILING_SL_LADDER",
+                    f"🛡️ {sym} reached {ladder_label} (SL raised to ₹{ladder_sl})",
+                    {"symbol": sym, "new_sl": ladder_sl, "progress_pct": round(progress * 100, 1)}
                 )
 
         unrealized = (ltp - entry) * qty
@@ -747,7 +747,7 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
 
         log_msg(
             sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "PORTFOLIO_FLOOR_EXIT",
-            f"💰 Portfolio Profit Floor triggered (Peak: +₹{state['peak_portfolio_pnl']:,.2f}, Floor: +₹{floor:,.2f}) → Liquidated {len(remaining_open)} positions | Locked Net P&L: ₹{total_locked_pnl:+,.2f}",
+            f"💰 Portfolio Profit Floor triggered (Peak: +₹{state['peak_portfolio_pnl']:,.2f}, Floor: +₹{floor:,.2f}) -> Liquidated {len(remaining_open)} positions | Locked Net P&L: ₹{total_locked_pnl:+,.2f}",
             {"peak_pnl": state["peak_portfolio_pnl"], "floor": floor, "realized_pnl": round(total_locked_pnl, 2)}
         )
         state["peak_portfolio_pnl"] = 0.0
@@ -756,11 +756,69 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
         acct_ws.update("A2", [[round(cash, 2)]])
 
 
+# ==============================================================================
+# PHASE 3: 3:45 PM IST EOD ATR STRUCTURAL STOP-LOSS RECALIBRATOR
+# ==============================================================================
+def run_eod_sl_recalibration(gcp_creds_dict: dict):
+    if now_ist().weekday() >= 5:
+        return
+
+    sh = get_gsheet_client(gcp_creds_dict)
+    eod_id = now_ist().strftime("EOD-%Y%m%d-IST")
+    trades_ws = sh.worksheet("trades")
+    records = trades_ws.get_all_records()
+
+    open_rows = [(idx, row) for idx, row in enumerate(records, start=2) if row.get("status") == "OPEN"]
+    if not open_rows:
+        return
+
+    regime = get_market_regime_and_sectors()
+    regime_tightener = 0.25 if regime.get("defensive_mode") else 0.0
+
+    open_syms = list({row["symbol"] for _, row in open_rows})
+    try:
+        data = yf.download(open_syms, period="2mo", interval="1d", group_by="ticker", progress=False, threads=True)
+    except Exception:
+        return
+
+    ratcheted_count = 0
+    for idx, row in open_rows:
+        sym = row["symbol"]
+        tier = str(row.get("tier", "MID")).upper()
+        curr_sl = float(row["sl"])
+        try:
+            sub = data[sym].dropna(subset=["Close", "High", "Low"]) if len(open_syms) > 1 else data.dropna(subset=["Close", "High", "Low"])
+            if len(sub) < 15:
+                continue
+
+            daily_close = float(sub["Close"].iloc[-1])
+            atr_14 = float((sub["High"] - sub["Low"]).rolling(14).mean().iloc[-1])
+            mult = max(0.75, ATR_MULT_PER_TIER.get(tier, 1.5) - regime_tightener)
+
+            raw_chandelier_sl = daily_close - (mult * atr_14)
+            max_allowed_eod_sl = daily_close * 0.992
+            new_sl = round(min(raw_chandelier_sl, max_allowed_eod_sl), 2)
+
+            if new_sl > curr_sl:
+                trades_ws.update(f"G{idx}", [[new_sl]])
+                ratcheted_count += 1
+                log_msg(
+                    sh, eod_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "EOD_SL_RATCHET",
+                    f"📐 EOD ATR Recalibration: {sym} ({tier}) SL raised ₹{curr_sl} -> ₹{new_sl} (Close ₹{daily_close:.2f}, ATR ₹{atr_14:.2f})",
+                    {"symbol": sym, "old_sl": curr_sl, "new_sl": new_sl, "daily_close": round(daily_close, 2), "atr_14": round(atr_14, 2)}
+                )
+        except Exception:
+            continue
+
+    if ratcheted_count == 0:
+        log_msg(
+            sh, eod_id, "AG5_EXECUTION_BROKER", "SYSTEM", "EOD_SL_CHECK",
+            f"EOD ATR Recalibration complete across {len(open_rows)} open positions — existing trailing SLs already optimal.",
+            {"open_count": len(open_rows), "defensive_mode": regime.get("defensive_mode", False)}
+        )
+
+
 async def run_split_speed_session(api_key: str, gcp_creds_dict: dict, watchdog_ticks: int = 27, interval_sec: int = 30):
-    """
-    Phase 1 (0:00): Runs full 250-stock AI scan + entry execution.
-    Phase 2 (0:30 to 14:00): Runs 27 lightweight 30-second watchdog ticks (zero Gemini tokens).
-    """
     await run_full_cycle(api_key, gcp_creds_dict)
 
     sh = get_gsheet_client(gcp_creds_dict)
