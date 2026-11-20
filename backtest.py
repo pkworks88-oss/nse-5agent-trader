@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from engine import (
+from swing_engine import (
     FALLBACK_NSE_250,
     RISK_PER_TIER,
     ATR_MULT_PER_TIER,
