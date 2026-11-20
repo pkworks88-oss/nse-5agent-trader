@@ -6,6 +6,8 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+from backtest import run_historical_backtest
+from broker_adapter import get_broker_adapter
 from engine import (
     run_full_cycle,
     get_gsheet_client,
@@ -264,12 +266,13 @@ ag4_msgs = get_agent_msgs("AG4_CHIEF_ANALYST", 3)
 ag5_msgs = get_agent_msgs("AG5_EXECUTION_BROKER", 3)
 lesson_msgs = msgs_df[msgs_df["msg_type"] == "AGENT_LESSON"].head(6).to_dict("records") if not msgs_df.empty else []
 
-tab_dash, tab_charts, tab_port, tab_agents, tab_logs = st.tabs([
+tab_dash, tab_charts, tab_port, tab_agents, tab_logs, tab_bt_live = st.tabs([
     "🏠 Command Center",
     "📈 Live Charts",
     "💼 Portfolio & P&L",
     "🤖 Agents & Trust",
     "📜 Ledger",
+    "🧪 Backtest & Live Broker",
 ])
 
 with tab_dash:
@@ -673,6 +676,114 @@ with tab_logs:
             with st.chat_message("assistant"):
                 st.markdown(f"**`{r['timestamp']}`** — **{r['sender']}** ➡️ **{r['recipient']}**")
                 st.write(r["summary"])
+
+with tab_bt_live:
+    st.markdown("#### 🧪 Historical Strategy Backtester (Zero Gemini Tokens)")
+    st.caption("Replays historical NSE daily bars through your exact V3 funnel, 25%+10% trailing SL ladder, target rollover, stepped portfolio floor, and realistic STT/slippage.")
+
+    bt1, bt2, bt3, bt4 = st.columns([1.1, 1.1, 1.1, 1.3])
+    with bt1:
+        bt_months = st.selectbox("Lookback Horizon", [3, 6, 9, 12], index=1, format_func=lambda m: f"{m} Months")
+    with bt2:
+        bt_univ = st.selectbox("Universe Size", [50, 100, 150, 250], index=1, format_func=lambda n: f"Top {n} NSE Stocks")
+    with bt3:
+        bt_slots = st.selectbox("Max Open Positions", [5, 8, 10, 15], index=2)
+    with bt4:
+        bt_floor = st.checkbox("Enable +₹7k Stepped Floor", value=True)
+        bt_regime = st.checkbox("Enable NIFTY 20-SMA Filter", value=True)
+
+    if st.button("🚀 Run Historical Backtest Simulation", type="primary"):
+        with st.spinner(f"Replaying {bt_months} months across {bt_univ} NSE stocks..."):
+            bt_res = run_historical_backtest(
+                lookback_months=bt_months,
+                initial_capital=1_000_000.0,
+                max_open_positions=bt_slots,
+                universe_size=bt_univ,
+                use_nifty_regime_filter=bt_regime,
+                use_profit_floor=bt_floor,
+            )
+            st.session_state["bt_result"] = bt_res
+
+    bt_res = st.session_state.get("bt_result")
+    if bt_res:
+        if "error" in bt_res:
+            st.error(bt_res["error"])
+        else:
+            m = bt_res["metrics"]
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            k1.metric("Final Equity", f"₹{m['final_equity']:,.0f}", f"{m['net_return_pct']:+.2f}%")
+            k2.metric("NIFTY 50 Return", f"{m['nifty_return_pct']:+.2f}%", f"Alpha: {m['alpha_pct']:+.2f}%")
+            k3.metric("Win Rate", f"{m['win_rate_pct']}%", f"{m['total_closed_trades']} Closed")
+            k4.metric("Profit Factor", f"{m['profit_factor']}", f"Avg Win ₹{m['avg_win']:,.0f}")
+            k5.metric("Max Drawdown", f"{m['max_drawdown_pct']}%", "Peak-to-Trough")
+            k6.metric("Sharpe Ratio", f"{m['sharpe_ratio']}", "Annualized")
+
+            eq_df = bt_res["equity_curve"]
+            fig_bt = go.Figure()
+            fig_bt.add_trace(go.Scatter(
+                x=eq_df["date"],
+                y=eq_df["portfolio_equity"],
+                mode="lines",
+                name="V3 5-Agent Strategy (₹)",
+                line=dict(color="#10b981", width=3),
+            ))
+            fig_bt.add_trace(go.Scatter(
+                x=eq_df["date"],
+                y=eq_df["nifty_benchmark"],
+                mode="lines",
+                name="NIFTY 50 Buy & Hold (₹10L Eq.)",
+                line=dict(color="#94a3b8", width=2, dash="dash"),
+            ))
+            fig_bt.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="#0b1324",
+                plot_bgcolor="#081020",
+                height=340,
+                margin=dict(l=10, r=10, t=20, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                yaxis_title="Simulated Portfolio Value (₹)",
+            )
+            st.plotly_chart(fig_bt, use_container_width=True)
+
+            if not bt_res["closed_trades"].empty:
+                with st.expander(f"Inspect {len(bt_res['closed_trades'])} Simulated Closed Trades"):
+                    st.dataframe(bt_res["closed_trades"], use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### 🔌 Live NSE Broker Bridge & SEBI 2026 Readiness (Sandbox / Static-IP VPS)")
+    br1, br2, br3, br4 = st.columns([1.2, 1.2, 1.2, 1.4])
+    with br1:
+        broker_choice = st.selectbox("Zero-API Broker Adapter", ["DHAN (DhanHQ v2)", "ANGEL (SmartAPI)"])
+    with br2:
+        exec_mode = st.selectbox("Execution Mode", ["SANDBOX (Paper Dry-Run)", "LIVE (Static-IP VPS Required)"])
+    with br3:
+        live_cap = st.number_input("Live Capital Allocation (₹)", min_value=10_000, max_value=5_000_000, value=100_000, step=10_000)
+    with br4:
+        daily_loss_cap = st.number_input("Hard Daily Loss Kill-Switch (₹)", min_value=1_000, max_value=250_000, value=5_000, step=500)
+
+    b_key = "DHAN" if "DHAN" in broker_choice else "ANGEL"
+    is_live = "LIVE" in exec_mode
+    adapter = get_broker_adapter(b_key, live_mode=is_live, allocated_capital=float(live_cap), max_daily_loss_inr=float(daily_loss_cap))
+    ks_tripped, ks_msg = adapter.check_kill_switch(realized_pnl, unrealized_pnl_total)
+
+    st.markdown(f"""
+    <div class="panel-box">
+        <b>SEBI 2026 Retail Algo Checklist:</b><br>
+        • <b>Hosting IP:</b> {'⚠️ Requires Static Whitelisted VPS IP (GitHub Actions dynamic IPs are blocked for live broker orders)' if is_live else '✅ Sandbox mode active — safe on Streamlit Cloud / GitHub Actions'}<br>
+        • <b>Exchange-Side Protection:</b> Every BUY routes an automated <b>GTT / OCO Bracket</b> (SL + Target) directly on NSE servers.<br>
+        • <b>Daily Kill-Switch Status:</b> <span style="color:{'#f87171' if ks_tripped else '#34d399'};">{ks_msg}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        if st.button("🧪 Test Broker Sandbox Order + GTT Bracket", use_container_width=True):
+            test_res = adapter.place_delivery_buy_with_gtt("RELIANCE.NS", 1, 1300.0, 1265.0, 1370.0)
+            st.success(test_res.message)
+    with bc2:
+        if st.button("🚨 EMERGENCY KILL SWITCH (Cancel All & Halt)", use_container_width=True):
+            ks_out = adapter.cancel_all_and_square_off()
+            st.error(f"Emergency Kill Switch Activated at {ks_out['timestamp_ist']} ({ks_out['mode']} mode).")
 
 if auto_refresh:
     import time
