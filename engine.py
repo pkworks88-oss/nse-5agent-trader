@@ -25,6 +25,7 @@ SHEET_NAME = "NSE_5Agent_Ledger"
 MAX_OPEN_POSITIONS = 10
 RISK_PER_TIER = {"LOW": 0.015, "MID": 0.010, "HIGH": 0.004}
 ATR_MULT_PER_TIER = {"LOW": 1.5, "MID": 2.0, "HIGH": 1.0}
+TIER_TO_AGENT = {"LOW": "AG1_LOW_RISK", "MID": "AG2_MID_RISK", "HIGH": "AG3_HIGH_RISK"}
 
 SECTOR_INDICES = {
     "BANK": "^NSEBANK",
@@ -113,6 +114,94 @@ def log_msg(sh, cycle_id: str, sender: str, recipient: str, msg_type: str, summa
 
 
 # ==============================================================================
+# BATCH 2: DYNAMIC AGENT TRUST SCORES (0-100 ELO) + REFLECTION LESSONS
+# ==============================================================================
+def infer_trade_agent(row: dict) -> str:
+    reason = str(row.get("reason", row.get("reasoning", "")))
+    for ag in ("AG1_LOW_RISK", "AG2_MID_RISK", "AG3_HIGH_RISK"):
+        if f"[{ag}]" in reason or ag in reason:
+            return ag
+    tier = str(row.get("tier", "MID")).upper()
+    return TIER_TO_AGENT.get(tier, "AG2_MID_RISK")
+
+
+def compute_agent_trust_scores(trades_records: list[dict]) -> dict[str, dict]:
+    """
+    Computes dynamic 0-100 Trust Scores (starting at 50) for AG1, AG2, AG3
+    based on closed trade outcomes and unrealized winners.
+    """
+    stats = {
+        "AG1_LOW_RISK": {"score": 50, "wins": 0, "losses": 0, "net_pnl": 0.0, "label": "AG1 (Low Risk)"},
+        "AG2_MID_RISK": {"score": 50, "wins": 0, "losses": 0, "net_pnl": 0.0, "label": "AG2 (Mid Risk)"},
+        "AG3_HIGH_RISK": {"score": 50, "wins": 0, "losses": 0, "net_pnl": 0.0, "label": "AG3 (High Risk)"},
+    }
+    for r in trades_records:
+        status = str(r.get("status", ""))
+        if status in ("OPEN", "", "None"):
+            continue
+        ag = infer_trade_agent(r)
+        if ag not in stats:
+            continue
+        pnl = float(r.get("pnl", 0) or 0)
+        entry = float(r.get("entry", 0) or 0)
+        qty = float(r.get("qty", 0) or 0)
+        cost = max(entry * qty, 1.0)
+        ret_pct = (pnl / cost) * 100.0
+
+        stats[ag]["net_pnl"] = round(stats[ag]["net_pnl"] + pnl, 2)
+        if pnl > 0:
+            stats[ag]["wins"] += 1
+            delta = min(8, max(3, int(round(3 + ret_pct))))
+            stats[ag]["score"] = min(100, stats[ag]["score"] + delta)
+        elif pnl < 0:
+            stats[ag]["losses"] += 1
+            delta = min(8, max(3, int(round(3 + abs(ret_pct)))))
+            stats[ag]["score"] = max(5, stats[ag]["score"] - delta)
+
+    return stats
+
+
+def record_trade_reflection(sh, cycle_id: str, agent_id: str, symbol: str, tier: str, exit_tag: str, pnl: float, entry: float, exit_px: float, old_score: int, new_score: int):
+    ret_pct = ((exit_px - entry) / max(entry, 0.01)) * 100.0
+    if pnl > 0:
+        lesson = (
+            f"[{agent_id}] {symbol} ({tier}) closed +{ret_pct:.2f}% (₹{pnl:+,.2f}) via {exit_tag}. "
+            f"Momentum + VWAP confirmation worked; Trust Score {old_score} -> {new_score}."
+        )
+    else:
+        lesson = (
+            f"[{agent_id}] {symbol} ({tier}) hit {exit_tag} ({ret_pct:.2f}%, ₹{pnl:+,.2f}). "
+            f"Tighten sector alignment & avoid chasing extended candles; Trust Score {old_score} -> {new_score}."
+        )
+    log_msg(
+        sh,
+        cycle_id,
+        agent_id,
+        "AG4_CHIEF_ANALYST",
+        "AGENT_LESSON",
+        lesson,
+        {
+            "agent_id": agent_id,
+            "symbol": symbol,
+            "tier": tier,
+            "exit_tag": exit_tag,
+            "pnl": pnl,
+            "old_score": old_score,
+            "new_score": new_score,
+        },
+    )
+
+
+def get_recent_agent_lessons(sh, limit: int = 5) -> list[str]:
+    try:
+        rows = sh.worksheet("agent_messages").get_all_records()
+        lessons = [str(r.get("summary", "")) for r in rows if r.get("msg_type") == "AGENT_LESSON"]
+        return lessons[-limit:]
+    except Exception:
+        return []
+
+
+# ==============================================================================
 # SKILL 1 & 2: NIFTY 50 MARKET REGIME + SECTOR STRENGTH + CLOSED-TRADE MEMORY
 # ==============================================================================
 def get_market_regime_and_sectors() -> dict:
@@ -151,20 +240,12 @@ def get_market_regime_and_sectors() -> dict:
     return regime
 
 
-def build_trade_memory_scorecard(trades_records: list[dict]) -> str:
-    closed = [r for r in trades_records if r.get("status") not in ("OPEN", "", None)]
-    if not closed:
-        return "No closed trades yet; enforce strict R:R >= 1:1.6 and clean news."
-    recent = closed[-20:]
-    wins = [r for r in recent if float(r.get("pnl", 0) or 0) > 0]
-    win_rate = round((len(wins) / len(recent)) * 100, 1)
-    tier_stats = []
-    for t in ("LOW", "MID", "HIGH"):
-        t_rows = [r for r in recent if r.get("tier") == t]
-        if t_rows:
-            t_wins = sum(1 for r in t_rows if float(r.get("pnl", 0) or 0) > 0)
-            tier_stats.append(f"{t}: {t_wins}/{len(t_rows)} wins")
-    return f"Last {len(recent)} closed trades win-rate: {win_rate}% ({', '.join(tier_stats)}). Prioritize tiers with higher win-rate."
+def build_trade_memory_scorecard(trades_records: list[dict], trust_scores: dict[str, dict], lessons: list[str]) -> str:
+    trust_summary = " | ".join(
+        [f"{k}: Trust {v['score']}/100 ({v['wins']}W-{v['losses']}L, ₹{v['net_pnl']:+,.0f})" for k, v in trust_scores.items()]
+    )
+    lesson_text = " ; ".join(lessons[-3:]) if lessons else "No post-trade losses logged yet; enforce strict R:R >= 1:1.6."
+    return f"Agent Trust Standings -> {trust_summary}. Recent Self-Reflections -> {lesson_text}"
 
 
 # ==============================================================================
@@ -394,16 +475,21 @@ def quant_fallback_screener(agent_id: str, data_slice: list[dict]) -> list[Stock
 
 async def run_screener(
     sh, client, cycle_id: str, agent_id: str, rules: str,
-    data_slice: list[dict], scanned_count: int, mover_count: int, regime: dict
+    data_slice: list[dict], scanned_count: int, mover_count: int,
+    regime: dict, trust_info: dict, lessons: list[str]
 ) -> list[StockSignal]:
     if not data_slice:
         log_msg(sh, cycle_id, agent_id, "AG4_CHIEF_ANALYST", "NO_SIGNAL", "No NSE market data fetched.", [])
         return []
 
+    agent_lessons = [l for l in lessons if f"[{agent_id}]" in l]
+    lesson_note = f"Your recent self-reflection: {agent_lessons[-1]}" if agent_lessons else ""
+
     regime_note = (
         f"Market Context: NIFTY 50 is {regime['nifty_chg_pct']:+.2f}% "
         f"({'DEFENSIVE MODE - be extra selective' if regime['defensive_mode'] else 'BULLISH/NORMAL'}). "
-        f"Leading Sectors: {', '.join(regime['top_sectors'])}."
+        f"Leading Sectors: {', '.join(regime['top_sectors'])}. "
+        f"Your current Trust Score is {trust_info['score']}/100 ({trust_info['wins']}W-{trust_info['losses']}L). {lesson_note}"
     )
     prompt = (
         f"You are {agent_id} for NSE India (scanning {scanned_count} live NSE stocks including {mover_count} live intraday movers). "
@@ -413,6 +499,8 @@ async def run_screener(
     try:
         raw = await generate_fast(client, prompt, list[StockSignal], temperature=0.2)
         signals = [StockSignal(**item) for item in raw]
+        for s in signals:
+            s.agent_id = agent_id
         mode_tag = ""
     except Exception:
         signals = quant_fallback_screener(agent_id, data_slice)
@@ -420,7 +508,7 @@ async def run_screener(
 
     mover_note = f" ({mover_count} live movers)" if mover_count > 0 else ""
     summary = (
-        f"Scanned {scanned_count} NSE stocks{mover_note} -> Sent {len(signals)} to AG4{mode_tag}: "
+        f"Scanned {scanned_count} NSE stocks{mover_note} [Trust {trust_info['score']}/100] -> Sent {len(signals)} to AG4{mode_tag}: "
         + ", ".join([f"{s.symbol} @ ₹{s.entry_price}" for s in signals])
         if signals
         else "No setups approved."
@@ -429,15 +517,17 @@ async def run_screener(
     return signals
 
 
-async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal], regime: dict, memory_scorecard: str) -> CommitteeOutput:
+async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal], regime: dict, memory_scorecard: str, trust_scores: dict) -> CommitteeOutput:
     enriched = []
     for c in candidates:
         earnings_soon = has_upcoming_earnings_48h(c.symbol)
         news_items = fetch_nse_news(c.symbol)
         if earnings_soon:
             news_items.insert(0, "ALERT: Quarterly earnings scheduled within 48 hours - SKIP to avoid gap risk.")
+        ag_trust = trust_scores.get(c.agent_id, {}).get("score", 50)
         enriched.append({
             "signal": c.model_dump(),
+            "proposing_agent_trust_score": ag_trust,
             "earnings_within_48h": earnings_soon,
             "news": news_items,
         })
@@ -450,9 +540,11 @@ async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal], regi
 
     prompt = (
         f"You are AG4, Chief Analyst for NSE India. {regime_rule} "
-        f"Historical Performance Feedback: {memory_scorecard} "
+        f"{memory_scorecard} "
+        "Weigh proposals according to each proposing agent's Trust Score (0-100; agents below 40 require higher conviction and cleaner setups). "
         f"Leading Sectors Today: {', '.join(regime['top_sectors'])}. "
         "Audit all candidates with their news headlines. Immediately SKIP any stock with earnings_within_48h=True or negative news. "
+        "Preserve exact source_agent (AG1_LOW_RISK, AG2_MID_RISK, or AG3_HIGH_RISK) on each decision. "
         f"Inputs: {json.dumps(enriched)}"
     )
     try:
@@ -462,7 +554,8 @@ async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal], regi
         tier_map = {"AG1_LOW_RISK": "LOW", "AG2_MID_RISK": "MID", "AG3_HIGH_RISK": "HIGH"}
         fallback_trades, seen = [], set()
         max_buys = 1 if regime["defensive_mode"] else 2
-        for item in enriched:
+        sorted_items = sorted(enriched, key=lambda x: x["proposing_agent_trust_score"], reverse=True)
+        for item in sorted_items:
             c = StockSignal(**item["signal"])
             if c.symbol in seen:
                 continue
@@ -473,6 +566,7 @@ async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal], regi
             fallback_trades.append(
                 FinalDecision(
                     symbol=c.symbol,
+                    source_agent=c.agent_id,
                     risk_tier=tier_map[c.agent_id],
                     action=action,
                     conviction=76 if action == "BUY" else 45,
@@ -480,7 +574,7 @@ async def run_ag4(sh, client, cycle_id: str, candidates: list[StockSignal], regi
                     stop_loss=c.stop_loss,
                     target_price=c.target_price,
                     news_status="CLEAR" if not item["earnings_within_48h"] else "NEGATIVE_RISK",
-                    reasoning=f"Quant + Regime audit: R:R = 1:{rr:.2f}, RSI = {c.rsi_14}, NIFTY = {regime['nifty_chg_pct']:+.2f}%.",
+                    reasoning=f"[{c.agent_id}] Quant + Trust audit: R:R = 1:{rr:.2f}, RSI = {c.rsi_14}, NIFTY = {regime['nifty_chg_pct']:+.2f}%.",
                 )
             )
         decision = CommitteeOutput(selected_trades=fallback_trades)
@@ -506,18 +600,9 @@ async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
     client = genai.Client(api_key=api_key.strip())
     cycle_id = now_ist().strftime("CYC-%H%M%S-IST")
 
-    existing_trades = sh.worksheet("trades").get_all_records()
-    open_holdings = {r["symbol"] for r in existing_trades if r.get("status") == "OPEN"}
-
-    regime = get_market_regime_and_sectors()
-    memory_scorecard = build_trade_memory_scorecard(existing_trades)
-    market_data, live_prices, mover_count = fetch_nse_metrics(excluded_symbols=open_holdings)
-    scanned_count = len(live_prices)
-
     # First run fast 30s watchdog tick immediately so existing positions are checked right away
     run_single_watchdog_tick(sh, cycle_id)
 
-    # Refresh open holdings count after watchdog check
     existing_trades = sh.worksheet("trades").get_all_records()
     open_holdings = {r["symbol"] for r in existing_trades if r.get("status") == "OPEN"}
 
@@ -528,6 +613,13 @@ async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
             {"open_count": len(open_holdings), "max_allowed": MAX_OPEN_POSITIONS}
         )
         return
+
+    trust_scores = compute_agent_trust_scores(existing_trades)
+    lessons = get_recent_agent_lessons(sh, limit=5)
+    regime = get_market_regime_and_sectors()
+    memory_scorecard = build_trade_memory_scorecard(existing_trades, trust_scores, lessons)
+    market_data, live_prices, mover_count = fetch_nse_metrics(excluded_symbols=open_holdings)
+    scanned_count = len(live_prices)
 
     ag1_pool = [d for d in market_data if d["beta"] <= 1.05 and d["ltp"] >= d["sma_200"] and d["rsi_14"] <= 72]
     ag1_slice = enrich_with_intraday_vwap(sorted(ag1_pool or market_data, key=lambda x: (x["beta"], -x["rvol"]))[:12])
@@ -541,21 +633,21 @@ async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
     ag1 = await run_screener(
         sh, client, cycle_id, "AG1_LOW_RISK",
         "Focus on LOW-RISK large-cap stability (lowest beta, price above 200-SMA, RSI under 72, tight 1.5x ATR stop).",
-        ag1_slice, scanned_count, mover_count, regime
+        ag1_slice, scanned_count, mover_count, regime, trust_scores["AG1_LOW_RISK"], lessons
     )
     ag2 = await run_screener(
         sh, client, cycle_id, "AG2_MID_RISK",
         "Focus on MID-RISK high-profit momentum swings (strong RVOL, healthy RSI 45-68, 2x ATR stop).",
-        ag2_slice, scanned_count, mover_count, regime
+        ag2_slice, scanned_count, mover_count, regime, trust_scores["AG2_MID_RISK"], lessons
     )
     ag3 = await run_screener(
         sh, client, cycle_id, "AG3_HIGH_RISK",
         "Focus on HIGH-RISK high-profit volatile movers (highest beta or sharp daily % move with volume, tight 1x ATR stop).",
-        ag3_slice, scanned_count, mover_count, regime
+        ag3_slice, scanned_count, mover_count, regime, trust_scores["AG3_HIGH_RISK"], lessons
     )
 
     candidates = ag1 + ag2 + ag3
-    decisions = (await run_ag4(sh, client, cycle_id, candidates, regime, memory_scorecard)).selected_trades if candidates else []
+    decisions = (await run_ag4(sh, client, cycle_id, candidates, regime, memory_scorecard, trust_scores)).selected_trades if candidates else []
 
     acct_ws = sh.worksheet("account")
     trades_ws = sh.worksheet("trades")
@@ -574,13 +666,14 @@ async def run_full_cycle(api_key: str, gcp_creds_dict: dict):
         if qty > 0 and cost <= cash:
             cash -= cost
             open_holdings.add(d.symbol)
+            tagged_reason = f"[{d.source_agent}] {d.reasoning}" if f"[{d.source_agent}]" not in d.reasoning else d.reasoning
             trades_ws.append_row([
                 now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-                d.symbol, d.risk_tier, "OPEN", qty, d.entry_price, d.stop_loss, d.target_price, "", 0, d.reasoning
+                d.symbol, d.risk_tier, "OPEN", qty, d.entry_price, d.stop_loss, d.target_price, "", 0, tagged_reason
             ])
             log_msg(
                 sh, cycle_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "PAPER_BUY",
-                f"BOUGHT {qty} {d.symbol} ({d.risk_tier}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
+                f"BOUGHT {qty} {d.symbol} ({d.risk_tier} via {d.source_agent}) @ ₹{d.entry_price} | SL: ₹{d.stop_loss} | TP: ₹{d.target_price}",
                 d.model_dump()
             )
 
@@ -669,6 +762,7 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
     cash_changed = False
     remaining_open = []
     combined_unrealized = 0.0
+    closed_events = []
 
     for idx, row in open_rows:
         sym = row["symbol"]
@@ -697,6 +791,7 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
                 f"SOLD {qty} {sym} ({exit_tag}) @ ₹{exit_px} | Net P&L: ₹{pnl:+,.2f}",
                 {"symbol": sym, "exit_price": exit_px, "pnl": pnl}
             )
+            closed_events.append((row, exit_tag, pnl, entry, exit_px))
             continue
 
         # 2. TARGET ROLLOVER (0.25% BREATHING BUFFER + TARGET 2 EXTENSION)
@@ -727,7 +822,7 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
 
         unrealized = (ltp - entry) * qty
         combined_unrealized += unrealized
-        remaining_open.append((idx, sym, qty, entry, ltp))
+        remaining_open.append((idx, row, sym, qty, entry, ltp))
 
     # 4. STEPPED PORTFOLIO PROFIT FLOOR (+₹7k / +₹10k / +₹15k / +₹20k+)
     if combined_unrealized > state["peak_portfolio_pnl"]:
@@ -736,13 +831,14 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
     floor = get_portfolio_profit_floor(state["peak_portfolio_pnl"])
     if floor is not None and remaining_open and combined_unrealized <= floor:
         total_locked_pnl = 0.0
-        for idx, sym, qty, entry, ltp in remaining_open:
+        for idx, row, sym, qty, entry, ltp in remaining_open:
             pnl = round((ltp - entry) * qty, 2)
             total_locked_pnl += pnl
             cash += ltp * qty
             cash_changed = True
             trades_ws.update(f"D{idx}", [["PORTFOLIO_FLOOR_EXIT"]])
             trades_ws.update(f"I{idx}:J{idx}", [[ltp, pnl]])
+            closed_events.append((row, "PORTFOLIO_FLOOR_EXIT", pnl, entry, ltp))
 
         log_msg(
             sh, tick_id, "AG5_EXECUTION_BROKER", "PORTFOLIO_LEDGER", "PORTFOLIO_FLOOR_EXIT",
@@ -753,6 +849,27 @@ def run_single_watchdog_tick(sh, tick_id: str, state: dict | None = None):
 
     if cash_changed:
         acct_ws.update("A2", [[round(cash, 2)]])
+
+    # 5. BATCH 2 SELF-REFLECTION & TRUST SCORE UPDATE ON CLOSED TRADES
+    if closed_events:
+        old_scores = compute_agent_trust_scores(records)
+        updated_records = trades_ws.get_all_records()
+        new_scores = compute_agent_trust_scores(updated_records)
+        for row, exit_tag, pnl, entry, exit_px in closed_events:
+            ag = infer_trade_agent(row)
+            record_trade_reflection(
+                sh,
+                tick_id,
+                ag,
+                row["symbol"],
+                str(row.get("tier", "MID")),
+                exit_tag,
+                pnl,
+                entry,
+                exit_px,
+                old_scores.get(ag, {}).get("score", 50),
+                new_scores.get(ag, {}).get("score", 50),
+            )
 
 
 # ==============================================================================
