@@ -1,0 +1,25 @@
+name: NSE Multi-Asset V4.8 Scheduled Paper Cycles
+
+on:
+  workflow_dispatch:
+    inputs:
+      desk:
+        description: "Desk to run (SWING, INTRADAY, FNO, COMMODITY)"
+        required: true
+        default: "SWING"
+  schedule:
+    # 10:15 UTC = 15:45 IST Swing EOD cycle (Mon-Fri)
+    - cron: "15 10 * * 1-5"
+
+jobs:
+  run-v48-cycle:
+    runs-on: ubuntu-latest
+    env:
+      LIVE_MODE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python headless_runner.py --desk "${{ github.event.inputs.desk || 'SWING' }}" --max-entries 1
