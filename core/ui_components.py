@@ -1,3 +1,4 @@
+import time
 import json
 from typing import Any, Dict, List
 import pandas as pd
@@ -418,3 +419,12 @@ def render_desk_workspace(store: Any, state: Dict[str, Any], desk_key: str, defa
         st.dataframe(df_c[[c for c in cols_show if c in df_c.columns]], width="stretch", hide_index=True)
 
     render_agent_war_room(state["agent_messages"], limit=10, scope_desk=cfg.key.upper())
+def render_auto_refresh_control(default_enabled: bool = False, interval_sec: int = 20, key_prefix: str = "main") -> None:
+    """Optional polling loop that respects the 20s ledger cache TTL."""
+    interval_sec = max(20, int(interval_sec))
+    c1, c2 = st.columns([1, 3])
+    enabled = c1.toggle("Auto-Refresh", value=default_enabled, key=f"{key_prefix}_autorefresh")
+    sec = c2.number_input("Interval (sec)", min_value=20, max_value=300, value=interval_sec, step=5, key=f"{key_prefix}_refresh_sec")
+    if enabled:
+        time.sleep(int(sec))
+        st.rerun()
