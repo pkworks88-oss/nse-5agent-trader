@@ -1,0 +1,64 @@
+name: NSE V4.8 Trading Session (20s watchdog + 5/15-min cycles)
+
+# ONE long-running job per half-day instead of a new 5-minute job each time.
+#   * pip install happens once (not every 5 minutes)
+#   * the 20-second watchdog runs continuously (not only in the gaps between desk cycles)
+#   * cycles fire exactly on :00/:05/:10... (INTRADAY, FNO, COMMODITY) and :00/:15/:30/:45 (SWING)
+# GitHub caps a job at 6 h, so the day is split: morning 09:10-12:40 IST, afternoon 12:40-15:35 IST.
+# NOTE: free private repos only get 2,000 Actions minutes/month (this uses ~385 min per trading day).
+#       Use a PUBLIC repo (secrets stay secret, the ledger lives in Google Sheets) or run run_local_loop.py on your own PC/VPS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      until_ist:
+        description: "Stop time in IST (HH:MM)"
+        required: true
+        default: "15:35"
+      force_session:
+        description: "Ignore market hours / holidays (testing only)"
+        required: true
+        default: "false"
+      dry_run:
+        description: "Evaluate only, write nothing"
+        required: true
+        default: "false"
+  schedule:
+    - cron: "40 3 * * 1-5"    # 09:10 IST  -> runs until 12:40 IST
+    - cron: "0 7 * * 1-5"     # 12:30 IST  -> queued behind the morning job, runs until 15:35 IST
+
+concurrency:
+  group: nse-v48-trading-session
+  cancel-in-progress: false
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      LIVE_MODE: "false"
+      CAS_ENABLED: "true"
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      UNIFIED_2L_SHEET_ID: ${{ secrets.UNIFIED_2L_SHEET_ID }}
+      GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+      UNTIL_IST: ${{ github.event_name == 'schedule' && (github.event.schedule == '40 3 * * 1-5' && '12:40' || '15:35') || github.event.inputs.until_ist }}
+      FORCE_SESSION: ${{ github.event.inputs.force_session }}
+      DRY_RUN: ${{ github.event.inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Connection + data diagnostics (fails fast on a bad Google Sheet / secrets)
+        run: python diagnose.py --quick
+      - name: Trading session
+        run: |
+          ARGS="--until-ist ${UNTIL_IST:-15:35}"
+          if [ "$FORCE_SESSION" = "true" ]; then ARGS="$ARGS --force-session"; fi
+          if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          python run_local_loop.py $ARGS
