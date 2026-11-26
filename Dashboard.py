@@ -9,7 +9,6 @@ from core.ledger import LedgerStore, load_ledger_cached
 from core.ui_components import (
     derive_free_cash,
     render_agent_war_room,
-    render_auto_refresh_control,
     render_capital_settings,
     render_desk_and_agent_scorecards,
     render_filter_watch_table,
@@ -49,7 +48,7 @@ total_net_pnl = unrealized_net + realized_net
 
 k1, k2, k3, k4 = st.columns(4)
 k1.markdown(
-    f"<div class='v48-kpi'><div class='v48-kpi-label'>Total Capital & Combined Free Cash</div>"
+    f"<div class='v48-kpi'><div class='v48-kpi-label'>Total Capital &amp; Combined Free Cash</div>"
     f"<div class='v48-kpi-val'>₹{total_configured_cap:,.0f}</div>"
     f"<div class='v48-kpi-sub'>Free Cash: ₹{total_free_cash:,.2f} (SW ₹{swing_free_cash:,.0f} | EQ ₹{eq_free_cash:,.0f} | F&O ₹{fno_free_cash:,.0f})</div></div>",
     unsafe_allow_html=True,
@@ -63,13 +62,13 @@ k2.markdown(
 )
 pnl_col = "#34D399" if total_net_pnl >= 0 else "#FB7185"
 k3.markdown(
-    f"<div class='v48-kpi'><div class='v48-kpi-label'>Total Net P&L (Unreal Net + Realized)</div>"
+    f"<div class='v48-kpi'><div class='v48-kpi-label'>Total Net P&amp;L (Unreal Net + Realized)</div>"
     f"<div class='v48-kpi-val' style='color:{pnl_col};'>{'+' if total_net_pnl >= 0 else ''}₹{total_net_pnl:,.2f}</div>"
     f"<div class='v48-kpi-sub'>Unreal Gross ₹{unrealized_gross:+,.0f} (Net ₹{unrealized_net:+,.0f}) | Realized ₹{realized_net:+,.2f}</div></div>",
     unsafe_allow_html=True,
 )
 k4.markdown(
-    f"<div class='v48-kpi'><div class='v48-kpi-label'>Composite Trust & Graduation Gate</div>"
+    f"<div class='v48-kpi'><div class='v48-kpi-label'>Composite Trust &amp; Graduation Gate</div>"
     f"<div class='v48-kpi-val'>{trust_data['composite_trust']}/100 (PF {trust_data['profit_factor']:.2f})</div>"
     f"<div class='v48-kpi-sub'>V4.8 Closed {trust_data['v48_closed_count']}/100 | Open: {len(open_trades)}</div></div>",
     unsafe_allow_html=True,
@@ -88,16 +87,3 @@ ex2.download_button("⬇ Download Complete V4.8 JSON Snapshot", data=json.dumps(
 
 st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
 render_agent_war_room(state["agent_messages"], limit=15, scope_desk="ALL")
-
-st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
-render_auto_refresh_control(default_enabled=False, interval_sec=20, key_prefix="dash")
-```[cite: 2]
-
----
-
-### 2. Exact Additions to `core/ui_components.py`
-
-1. Add `import time` at the very top of `core/ui_components.py` (right above `import json`)[cite: 2]:
-```python
-import time
-import json

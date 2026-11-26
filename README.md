@@ -27,3 +27,9 @@ Uses the live scoring, sizing, audit, charges, trailing, rollover, time-stop, fl
 
 ## Known limits
 Hard-coded stock universe (survivorship bias in backtests); NSE holiday list covers 2026 only; Gemini/news/earnings cannot be replayed; commodity prices are proxies; live broker adapters are intentionally not implemented (`LIVE_MODE` rejects orders).
+
+## Running automatically (V4.8.3)
+* **Check first:** `python diagnose.py` (full) or `python diagnose.py --quick`. It tests secrets, a real Google-Sheet write, the live price feed, the market gates and dry-runs every desk, printing the exact rejection reason of each candidate. Nothing is written to the trade ledger.
+* **Best:** run `python run_local_loop.py` on your own PC/VPS during market hours. One process: the 20-second watchdog has its own clock; cycles run in a worker thread at :00/:05/:10… (INTRADAY, FNO, COMMODITY) and :00/:15/:30/:45 (SWING).
+* **GitHub Actions:** `.github/workflows/v48_cycles.yml` starts two long sessions per day (09:10–12:40 and 12:40–15:35 IST) running the same loop. Free *private* repos get only 2,000 Actions minutes/month (this needs ~385 min per trading day), so use a public repo or your own machine.
+* Tunables (env): `CYCLE_BUDGET_SEC` (90), `MAX_CANDIDATES_PER_CYCLE` (12), `GEMINI_TIMEOUT_MS` (8000).

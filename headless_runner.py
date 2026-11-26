@@ -10,7 +10,7 @@ from core.broker_adapter import BrokerAdapter
 from core.charges import compute_net_rr, estimate_roundtrip_charges
 from core.config import (normalize_desk_key, DEFENSIVE_ALLOWED_TIERS, DEFENSIVE_RISK_MULT, EARNINGS_BLACKOUT_HOURS, FNO_MIN_PREMIUM, MAX_POSITIONS_PER_SECTOR,
                          MIN_CONVICTION, get_desk_config, get_effective_desk_config)
-from core.intelligence import evaluate_with_gemini_if_configured, fetch_news_sentiment, get_desk_candidates
+from core.intelligence import check_earnings_hours, evaluate_with_gemini_if_configured, fetch_news_sentiment, get_desk_candidates
 from core.ledger import LedgerStore
 from core.market_data import STALE_FEEDS, get_live_quotes_batch, get_nse_session_status, get_quote_snapshot, get_swing_regime
 from core.scenario_sim import run_bootstrap_simulation
@@ -70,6 +70,9 @@ def _swing_day_pnl(all_trades: List[Dict[str, Any]], desk_open: List[Dict[str, A
     return round(total, 2)
 
 
+_LAST_FULL_SYNC: float = 0.0
+
+
 def run_watchdog_pass(store: LedgerStore, state: Dict[str, Any], dry_run: bool = False, now_utc: Optional[datetime] = None) -> Dict[str, Any]:
     all_trades = state.get("trades", [])
     open_trades = [t for t in all_trades if str(t.get("status", "")).upper() == "OPEN"]
@@ -95,8 +98,15 @@ def run_watchdog_pass(store: LedgerStore, state: Dict[str, Any], dry_run: bool =
 
     wd_res["skipped_stale_feed"] = sorted(stale_syms) if not sess_now["is_eod_squareoff"] else []
 
-    if not dry_run:
+    global _LAST_FULL_SYNC
+    peak_changed = (abs(float(wd_res.get("combined_peak_pnl", 0.0)) - persisted_peak) > 0.005
+                    or abs(float(wd_res.get("swing_peak_pnl", 0.0)) - float(accounts.get("swing_peak_pnl", 0.0) or 0.0)) > 0.005
+                    or str(accounts.get("peak_date", "")) != _today_ist_date_str())
+    periodic = (time.monotonic() - _LAST_FULL_SYNC) > 300          # refresh MFE/MAE/LTP columns every 5 min
+    if not dry_run and (wd_res["actions"] or peak_changed or periodic):
+        _LAST_FULL_SYNC = time.monotonic()
         store.sync_watchdog_trades(wd_res.get("trades", []), combined_peak_pnl=wd_res.get("combined_peak_pnl"), locked_floor=wd_res.get("locked_floor"), peak_date=_today_ist_date_str(), swing_peak_pnl=wd_res.get("swing_peak_pnl"))
+    if not dry_run:
         if wd_res["actions"]:
             ist_dt = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             cycle_id = f"WD-20S-{ist_dt.strftime('%Y%m%d%H%M%S')}"
@@ -111,15 +121,37 @@ def run_watchdog_pass(store: LedgerStore, state: Dict[str, Any], dry_run: bool =
     return wd_res
 
 
-def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bool = False, cas_enabled: Optional[bool] = None) -> Dict[str, Any]:
+def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bool = False, cas_enabled: Optional[bool] = None,
+              dry_run: bool = False, skip_watchdog: bool = False) -> Dict[str, Any]:
+    """One entry-scan cycle for a desk.
+    dry_run=True : evaluate everything, write NOTHING (used by diagnose.py); the result lists every decision.
+    skip_watchdog: the caller (run_local_loop) already runs the 20-second watchdog in parallel."""
+    store = LedgerStore()
+    store.begin_message_buffer()                       # all agent messages go out in ONE Sheets call
+    try:
+        res = _run_cycle(store, desk, max_entries, ignore_session_gate, cas_enabled, dry_run, skip_watchdog)
+    finally:
+        if dry_run:
+            store.discard_messages()
+        else:
+            try:
+                store.flush_messages()
+            except Exception as exc:                   # a log write must never kill a trading cycle
+                print(f"[WARN] agent-message flush failed: {exc}")
+    res.setdefault("decisions", [])
+    return res
+
+
+def _run_cycle(store: LedgerStore, desk: str, max_entries: int, ignore_session_gate: bool, cas_enabled: Optional[bool],
+               dry_run: bool, skip_watchdog: bool) -> Dict[str, Any]:
     desk_upper = normalize_desk_key(desk).upper()
     cfg = get_desk_config(desk_upper)
 
     broker = BrokerAdapter()
-    store = LedgerStore()
     state = store.load_all()
-    wd_summary = run_watchdog_pass(store, state, dry_run=False)
-    state = store.load_all()
+    wd_summary = {} if skip_watchdog else run_watchdog_pass(store, state, dry_run=dry_run)
+    if not skip_watchdog:
+        state = store.load_all()
     cfg = get_effective_desk_config(desk_upper, state.get("accounts", {}))     # dashboard settings reach the runner here
 
     ist_dt = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
@@ -183,17 +215,36 @@ def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bo
 
     evaluated = 0
     entered = 0
+    decisions: List[Dict[str, Any]] = []
+    reason_counts: Dict[str, int] = {}
+    t0 = time.monotonic()
+    budget_sec = float(os.getenv("CYCLE_BUDGET_SEC", "90"))
+    max_candidates = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", "12"))
+    budget_note = ""
+
+    def decide(sym_: str, cand_: Dict[str, Any], approved_: bool, reasons_: List[str], conv_: Optional[int] = None) -> None:
+        decisions.append({"symbol": sym_, "tier": cand_.get("tier"), "conviction": conv_ if conv_ is not None else cand_.get("conviction"),
+                          "entry": cand_.get("entry"), "approved": approved_, "reasons": reasons_})
+        for r_ in reasons_:
+            key = r_.split(" (")[0][:60]
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+
     for cand in get_desk_candidates(desk_upper):
         if entered >= max_entries:
+            break
+        if evaluated >= max_candidates or (time.monotonic() - t0) > budget_sec:
+            budget_note = f"stopped after {evaluated} candidates / {time.monotonic() - t0:.0f}s (budget {max_candidates} / {budget_sec:.0f}s)"
             break
         sym = str(cand["symbol"]).strip().upper()
         if sym in open_symbols:
             continue
         evaluated += 1
+
+        # ---- cheap, network-free gates first ----
         q = get_quote_snapshot(sym, default_entry=cand["entry"])
         feed_tag = str(cand.get("feed") or q.get("feed") or "")
         if feed_tag in STALE_FEEDS and os.getenv("ALLOW_FALLBACK_FEED", "false").strip().lower() != "true":
-            store.append_agent_message({"cycle_id": cycle_id, "timestamp": now_str, "sender": "AG4_CHIEF_ANALYST", "recipient": "AG5_EXECUTION_BROKER", "msg_type": "VERDICT", "summary": f"Rejected {sym} ({cfg.label}) — no live market data (feed={feed_tag}).", "payload_json": json.dumps({"approved": False, "reasons": ["STALE_FEED"], "feed": feed_tag})}, desk=cfg.label)
+            decide(sym, cand, False, [f"No live market data (feed={feed_tag})"])
             continue
         pre_reject: List[str] = []
         risk_pct_eff = cfg.risk_per_trade_pct
@@ -203,14 +254,14 @@ def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bo
             risk_pct_eff = cfg.risk_per_trade_pct * DEFENSIVE_RISK_MULT
         if cfg.key == "fno" and float(cand["entry"]) < FNO_MIN_PREMIUM:
             pre_reject.append(f"Premium ₹{cand['entry']} < minimum ₹{FNO_MIN_PREMIUM:.0f}")
-        news = fetch_news_sentiment(sym, limit=3)
-        ai_eval = evaluate_with_gemini_if_configured(cand, q, news)
-        effective_news_status = ai_eval["news_status"]
-        adj_conviction = max(0, min(100, int(cand["conviction"]) + int(ai_eval["conviction_adj"])))
+        screening_floor = MIN_CONVICTION - 10            # Gemini can add at most +10
+        if int(cand["conviction"]) < screening_floor:
+            decide(sym, cand, False, [f"Conviction {cand['conviction']} < screening floor {screening_floor}"])
+            continue
 
         sizing = compute_position_sizing(
             desk_capital=eff_capital, deployed_capital=deployed, entry_price=cand["entry"],
-            stop_loss=cand["sl"], target_price=cand["target"], conviction_score=adj_conviction,
+            stop_loss=cand["sl"], target_price=cand["target"], conviction_score=int(cand["conviction"]),
             max_pos_pct=cfg.max_pos_pct, risk_per_trade_pct=risk_pct_eff,
             soft_cushion_pct=cfg.soft_cushion_pct, baseline_slots=cfg.baseline_slots,
             current_open_slots=len(desk_open), sector=cand["sector"], sector_counts=sector_counts,
@@ -221,24 +272,37 @@ def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bo
         net_rr = compute_net_rr(cand["entry"], cand["sl"], cand["target"], max(1, sizing["qty"]), desk=cfg.label)
         charges = estimate_roundtrip_charges(cand["entry"], cand["target"], max(1, sizing["qty"]), desk=cfg.label)
         sim = run_bootstrap_simulation(cand["entry"], cand["sl"], cand["target"], max(1, sizing["qty"]), charges=charges)
-        audit = build_8_stage_audit(
-            symbol=sym, desk=cfg.label, tier=cand["tier"], entry=cand["entry"], sl=cand["sl"], target=cand["target"],
-            rsi=float(cand.get("rsi", q["rsi"])), rvol=float(cand.get("rvol", q["rvol"])),
-            pdh=float(cand.get("pdh", q["pdh"])), pdl=float(cand.get("pdl", q["pdl"])),
-            net_rr=net_rr, sector=cand["sector"], sector_count=sector_counts.get(cand["sector"], 0),
-            earnings_hours=cand["earnings_hours"], sizing_result=sizing, sim_result=sim,
-        )
+        def run_audit(earn_h: int) -> Any:
+            return build_8_stage_audit(
+                symbol=sym, desk=cfg.label, tier=cand["tier"], entry=cand["entry"], sl=cand["sl"], target=cand["target"],
+                rsi=float(cand.get("rsi", q["rsi"])), rvol=float(cand.get("rvol", q["rvol"])),
+                pdh=float(cand.get("pdh", q["pdh"])), pdl=float(cand.get("pdl", q["pdl"])),
+                net_rr=net_rr, sector=cand["sector"], sector_count=sector_counts.get(cand["sector"], 0),
+                earnings_hours=earn_h, sizing_result=sizing, sim_result=sim,
+            )
+        audit = run_audit(int(cand["earnings_hours"]))
+        if audit[6]["status"] == "APPROVED" and not cand.get("earnings_checked", True):
+            audit = run_audit(check_earnings_hours(sym))     # the only per-stock network call, and only for a setup that already passed
+        quant_reasons = list(pre_reject)
+        if audit[6]["status"] != "APPROVED":
+            quant_reasons.append(audit[6]["why"])
+        if quant_reasons:
+            decide(sym, cand, False, quant_reasons)
+            continue
 
-        stage7_approved = audit[6]["status"] == "APPROVED"
-        reject_reasons: List[str] = list(pre_reject)
-        if not stage7_approved:
-            reject_reasons.append(audit[6]["why"])
+        # ---- slow steps (news + Gemini) ONLY for candidates that already passed every quantitative gate ----
+        news = fetch_news_sentiment(sym, limit=3)
+        ai_eval = evaluate_with_gemini_if_configured(cand, q, news)
+        effective_news_status = ai_eval["news_status"]
+        adj_conviction = max(0, min(100, int(cand["conviction"]) + int(ai_eval["conviction_adj"])))
+        reject_reasons: List[str] = []
         if effective_news_status == "NEGATIVE_RISK":
             reject_reasons.append("Negative news risk")
         if adj_conviction < MIN_CONVICTION:
             reject_reasons.append(f"Conviction {adj_conviction} < {MIN_CONVICTION}")
-
         approved = len(reject_reasons) == 0
+        decide(sym, cand, approved, reject_reasons, adj_conviction)
+
         scout_sender = "AG1_LOW_RISK" if cand["tier"] == "LOW" else ("AG3_HIGH_RISK" if cand["tier"] == "HIGH" else "AG2_MID_RISK")
         store.append_agent_message({
             "cycle_id": cycle_id, "timestamp": now_str, "sender": scout_sender, "recipient": "AG4_CHIEF_ANALYST",
@@ -246,7 +310,6 @@ def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bo
             "summary": f"Proposed {sym} ({cand['tier']}) @ ₹{cand['entry']} | RSI {cand.get('rsi', q['rsi']):.1f} | RVOL {cand.get('rvol', q['rvol']):.2f}x | News {effective_news_status}",
             "payload_json": json.dumps({"symbol": sym, "tier": cand["tier"], "desk": cfg.label, "news": effective_news_status, "ai": ai_eval}),
         }, desk=cfg.label)
-
         verdict_detail = f"Net R:R 1:{net_rr:.2f}, Conv {adj_conviction}" if approved else "; ".join(reject_reasons)
         store.append_agent_message({
             "cycle_id": cycle_id, "timestamp": now_str, "sender": "AG4_CHIEF_ANALYST", "recipient": "AG5_EXECUTION_BROKER",
@@ -255,6 +318,9 @@ def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bo
             "payload_json": json.dumps({"schema": "v4.8", "approved": approved, "reasons": reject_reasons, "audit_8_stage": audit}),
         }, desk=cfg.label)
 
+        if approved and dry_run:
+            entered += 1                                  # would have entered; nothing is written in a dry run
+            continue
         if approved:
             fill = broker.place_order({"symbol": sym, "qty": sizing["qty"], "price": cand["entry"]})
             lot_sz = max(1, int(cand["lot_size"]))
@@ -282,17 +348,21 @@ def run_cycle(desk: str = "SWING", max_entries: int = 1, ignore_session_gate: bo
             deployed += sizing.get("cash_required", sizing["notional"])
             sector_counts[cand["sector"]] = sector_counts.get(cand["sector"], 0) + 1
 
+    top_reasons = sorted(reason_counts.items(), key=lambda kv: -kv[1])[:5]
     store.append_agent_message({
         "cycle_id": cycle_id, "timestamp": now_str, "sender": "AG4_CHIEF_ANALYST", "recipient": f"{desk_upper}_LEDGER",
         "msg_type": "CYCLE_SCAN",
-        "summary": f"{cfg.label} scan completed: evaluated {evaluated}, entered {entered} (Paper Mode).",
-        "payload_json": json.dumps({"desk": desk_upper, "evaluated": evaluated, "entered": entered}),
+        "summary": (f"{cfg.label} scan completed: evaluated {evaluated}, entered {entered} (Paper Mode)."
+                    + (f" Top rejections: {'; '.join(f'{k} x{v}' for k, v in top_reasons)}." if top_reasons and not entered else "")
+                    + (f" [{budget_note}]" if budget_note else "")),
+        "payload_json": json.dumps({"desk": desk_upper, "evaluated": evaluated, "entered": entered, "rejections": reason_counts, "decisions": decisions[:15]}),
     }, desk=cfg.label)
-    trust = compute_desk_and_agent_trust(store.load_all()["trades"])
+    trust = compute_desk_and_agent_trust(state["trades"])
     return {
         "version": "v4.8", "cadence_seconds": DESK_CADENCE_SECONDS.get(desk_upper, 300),
         "watchdog_seconds": 20, "live_mode": broker.live_mode, "ledger_source": state["source"],
-        "desk": desk_upper, "evaluated": evaluated, "entered": entered,
+        "desk": desk_upper, "evaluated": evaluated, "entered": entered, "dry_run": dry_run,
+        "regime": regime, "rejection_summary": reason_counts, "decisions": decisions, "budget_note": budget_note,
         "watchdog_summary": wd_summary, "batch_attribution": trust,
     }
 
@@ -312,9 +382,19 @@ def run_watchdog_loop(watchdog_seconds: int = 20, iterations: int = 1) -> Dict[s
 def trigger_manual_agent_cycle(desk: str = "ALL", max_entries: int = 1, watchdog_bursts: int = 1, ignore_session_gate: bool = True, cas_enabled: bool = True) -> Dict[str, Any]:
     d_up = "ALL" if str(desk or "ALL").strip().upper() == "ALL" else normalize_desk_key(desk).upper()
     desks_to_run = ["SWING", "INTRADAY", "FNO", "COMMODITY"] if d_up == "ALL" else [d_up]
-    cycle_results = [run_cycle(desk=d, max_entries=max_entries, ignore_session_gate=ignore_session_gate, cas_enabled=cas_enabled) for d in desks_to_run]
-    wd_res = run_watchdog_loop(watchdog_seconds=0, iterations=max(1, int(watchdog_bursts)))
-    return {"manual_run": True, "requested_desk": d_up, "cycles": cycle_results, "watchdog": wd_res}
+    cycle_results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    for d in desks_to_run:                              # one desk failing must not hide the others
+        try:
+            cycle_results.append(run_cycle(desk=d, max_entries=max_entries, ignore_session_gate=ignore_session_gate, cas_enabled=cas_enabled))
+        except Exception as exc:
+            errors.append({"desk": d, "error": f"{type(exc).__name__}: {exc}"})
+    try:
+        wd_res = run_watchdog_loop(watchdog_seconds=0, iterations=max(1, int(watchdog_bursts)))
+    except Exception as exc:
+        wd_res = {}
+        errors.append({"desk": "WATCHDOG", "error": f"{type(exc).__name__}: {exc}"})
+    return {"manual_run": True, "requested_desk": d_up, "cycles": cycle_results, "watchdog": wd_res, "errors": errors}
 
 
 if __name__ == "__main__":
@@ -325,6 +405,7 @@ if __name__ == "__main__":
     parser.add_argument("--watchdog-seconds", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--force-session", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="evaluate and print decisions, write nothing")
     args = parser.parse_args()
-    output = run_watchdog_loop(watchdog_seconds=args.watchdog_seconds, iterations=args.iterations) if args.watchdog_only else run_cycle(desk=args.desk, max_entries=args.max_entries, ignore_session_gate=args.force_session)
+    output = run_watchdog_loop(watchdog_seconds=args.watchdog_seconds, iterations=args.iterations) if args.watchdog_only else run_cycle(desk=args.desk, max_entries=args.max_entries, ignore_session_gate=args.force_session, dry_run=args.dry_run)
     print(json.dumps(output, indent=2))
