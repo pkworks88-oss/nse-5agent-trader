@@ -408,7 +408,7 @@ def render_desk_workspace(store: Any, state: Dict[str, Any], desk_key: str, defa
         f"Notional `₹{sizing['notional']:,.0f}` | Net R:R `1:{net_rr:.2f}` | Tag: **`{sizing['allocation_tag']}`**"
     )
 
-   bars = pd.DataFrame(get_ohlcv_bars(sel_chart_sym, q["ltp"], count=32))
+bars = pd.DataFrame(get_ohlcv_bars(sel_chart_sym, q["ltp"], count=32))
     x_vals = pd.to_datetime(bars["dt"], errors="coerce") if "dt" in bars.columns else bars["bar"]
     fig = go.Figure(data=[go.Candlestick(
         x=x_vals,
@@ -418,6 +418,18 @@ def render_desk_workspace(store: Any, state: Dict[str, Any], desk_key: str, defa
         close=bars["close"],
         name=sel_chart_sym,
     )])
+    fig.add_hline(y=q["pdh"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDH ₹{q['pdh']}")
+    fig.add_hline(y=q["pdl"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDL ₹{q['pdl']}")
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0B1120",
+        plot_bgcolor="#0F172A",
+        height=350,
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis=dict(type="date", tickformat="%b %d"),
+        xaxis_rangeslider_visible=False,
+    )
+    st.plotly_chart(fig, width="stretch")
     fig.add_hline(y=q["pdh"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDH ₹{q['pdh']}")
     fig.add_hline(y=q["pdl"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDL ₹{q['pdl']}")
     fig.update_layout(
