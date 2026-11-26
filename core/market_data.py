@@ -1,9 +1,8 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 import calendar
 import math
 import time
-from datetime import date
 import pandas as pd
 
 try:
@@ -11,14 +10,22 @@ try:
 except Exception:
     yf = None
 
-from core.config import FALLBACK_VIX, FNO_IV_SKEW, GOLD_IMPORT_DUTY_FACTOR, ENTRY_CUTOFF_IST_HOUR, ENTRY_CUTOFF_IST_MINUTE, EOD_SQUAREOFF_IST_HOUR, EOD_SQUAREOFF_IST_MINUTE
-from core.quant_engine import analyze_ohlcv_indicators, black_scholes_delta, black_scholes_price, classify_swing_regime, compute_vwap
+from core.config import (
+    ENTRY_CUTOFF_IST_HOUR,
+    ENTRY_CUTOFF_IST_MINUTE,
+    EOD_SQUAREOFF_IST_HOUR,
+    EOD_SQUAREOFF_IST_MINUTE,
+    FALLBACK_VIX,
+    FNO_IV_SKEW,
+    GOLD_IMPORT_DUTY_FACTOR,
+)
+from core.quant_engine import analyze_ohlcv_indicators, black_scholes_delta, black_scholes_price, classify_swing_regime, compute_vwap[cite: 39]
 
 NSE_HOLIDAYS_YYYY_MM_DD = {
     "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31", "2026-04-03",
     "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26", "2026-09-14",
     "2026-10-02", "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25",
-}
+}[cite: 39]
 
 FALLBACK_QUOTES: Dict[str, Dict[str, float]] = {
     "TATASTEEL.NS": {"ltp": 163.91, "chg_pct": -1.45, "pdh": 167.80, "pdl": 163.10, "bar_high": 164.50, "bar_low": 163.50, "rsi": 41.2, "rvol": 1.38, "atr": 3.6, "adx": 24.5, "vwap": 164.80},
@@ -56,28 +63,27 @@ FALLBACK_QUOTES: Dict[str, Dict[str, float]] = {
     "GOLDPETAL MCX": {"ltp": 7842.00, "chg_pct": 0.85, "pdh": 7855.00, "pdl": 7811.00, "bar_high": 7848.00, "bar_low": 7831.00, "rsi": 61.5, "rvol": 1.60, "atr": 24.0, "adx": 24.0, "vwap": 7834.00},
     "GOLDM MCX": {"ltp": 78420.00, "chg_pct": 0.85, "pdh": 78550.00, "pdl": 78110.00, "bar_high": 78480.00, "bar_low": 78310.00, "rsi": 61.5, "rvol": 1.60, "atr": 240.0, "adx": 24.0, "vwap": 78340.00},
     "CRUDEOILM MCX": {"ltp": 5865.00, "chg_pct": 0.43, "pdh": 5890.00, "pdl": 5810.00, "bar_high": 5878.00, "bar_low": 5845.00, "rsi": 59.0, "rvol": 1.45, "atr": 68.0, "adx": 22.1, "vwap": 5852.00},
-}
+}[cite: 39]
 
-# Feeds that are NOT real market data. The runner refuses to open trades on these
-# (set ALLOW_FALLBACK_FEED=true only for offline demos).
-STALE_FEEDS = {"fallback_calibrated", "entry_anchor_fallback", "index_spot_option_model_stale"}
+STALE_FEEDS = {"fallback_calibrated", "entry_anchor_fallback", "index_spot_option_model_stale"}[cite: 39]
 
 _QUOTE_CACHE: Dict[str, Dict[str, Any]] = {}
 _HISTORY_CACHE: Dict[str, Dict[str, Any]] = {}
 QUOTE_CACHE_TTL_SECONDS: float = 18.0
 _YF_RATE_LIMITED_UNTIL: float = 0.0
 _YF_COOLDOWN_SECONDS: float = 120.0
+IST_TZ = timezone(timedelta(hours=5, minutes=30))[cite: 39]
 
 
 def _yf_allowed() -> bool:
-    return yf is not None and time.monotonic() >= _YF_RATE_LIMITED_UNTIL
+    return yf is not None and time.monotonic() >= _YF_RATE_LIMITED_UNTIL[cite: 39]
 
 
 def _mark_yf_rate_limited(exc: Exception) -> None:
     global _YF_RATE_LIMITED_UNTIL
     msg = str(exc).lower()
     if "429" in msg or "rate limit" in msg or "too many requests" in msg or "crumb" in msg:
-        _YF_RATE_LIMITED_UNTIL = time.monotonic() + _YF_COOLDOWN_SECONDS
+        _YF_RATE_LIMITED_UNTIL = time.monotonic() + _YF_COOLDOWN_SECONDS[cite: 39]
 
 
 def get_nse_session_status(now_utc: Optional[datetime] = None) -> Dict[str, Any]:
@@ -130,7 +136,7 @@ def get_nse_session_status(now_utc: Optional[datetime] = None) -> Dict[str, Any]
         "time_iraq": dt_iraq.strftime("%H:%M:%S (Iraq +03)"),
         "session_window_ist": f"09:15 - 15:30 IST (Entries < {ENTRY_CUTOFF_IST_HOUR:02d}:{ENTRY_CUTOFF_IST_MINUTE:02d} IST)",
         "session_window_iraq": "06:45 - 13:00 (Iraq +03)",
-    }
+    }[cite: 39]
 
 
 def _fetch_real_ohlcv_df(sym: str, period: str = "3mo", interval: str = "1d") -> Optional[pd.DataFrame]:
@@ -148,34 +154,29 @@ def _fetch_real_ohlcv_df(sym: str, period: str = "3mo", interval: str = "1d") ->
             return df
     except Exception as exc:
         _mark_yf_rate_limited(exc)
-    return None
-
-
-IST_TZ = timezone(timedelta(hours=5, minutes=30))
+    return None[cite: 39]
 
 
 def _is_trading_day(d: date) -> bool:
-    return d.weekday() < 5 and d.strftime("%Y-%m-%d") not in NSE_HOLIDAYS_YYYY_MM_DD
+    return d.weekday() < 5 and d.strftime("%Y-%m-%d") not in NSE_HOLIDAYS_YYYY_MM_DD[cite: 39]
 
 
 def count_trading_days(start: date, end: date) -> int:
-    """Trading sessions in (start, end]  (entry day itself is not counted)."""
     n, d = 0, start + timedelta(days=1)
     while d <= end:
         if _is_trading_day(d):
             n += 1
         d += timedelta(days=1)
-    return n
+    return n[cite: 39]
 
 
 def _roll_back_to_trading_day(d: date) -> date:
     while not _is_trading_day(d):
         d -= timedelta(days=1)
-    return d
+    return d[cite: 39]
 
 
 def next_expiry(idx_root: str, now_ist: datetime) -> datetime:
-    """NIFTY: weekly Tuesday. BANKNIFTY: monthly, last Tuesday. Expiry at 15:30 IST; holiday -> previous trading day."""
     def at_close(d: date) -> datetime:
         return datetime(d.year, d.month, d.day, 15, 30, tzinfo=IST_TZ)
 
@@ -199,17 +200,15 @@ def next_expiry(idx_root: str, now_ist: datetime) -> datetime:
         m += 1
         if m > 12:
             m, y = 1, y + 1
-    return at_close(now_ist.date() + timedelta(days=7))
+    return at_close(now_ist.date() + timedelta(days=7))[cite: 39]
 
 
 def is_expiry_day(idx_root: str, now_ist: Optional[datetime] = None) -> bool:
     now_ist = now_ist or datetime.now(timezone.utc).astimezone(IST_TZ)
-    return next_expiry(idx_root, now_ist).date() == now_ist.date()
+    return next_expiry(idx_root, now_ist).date() == now_ist.date()[cite: 39]
 
 
 def _estimate_index_option_quote(sym: str, spot_map: Optional[Dict[str, float]] = None) -> Optional[Dict[str, float]]:
-    """Black-Scholes premium from live index spot + India VIX (as IV) + real time-to-expiry.
-    High/low premium are the premiums at the index's 1-minute high/low (wick-accurate for stops)."""
     clean = sym.strip().upper().replace("_", " ")
     parts = clean.split()
     if len(parts) < 3 or parts[0] not in ("NIFTY", "BANKNIFTY") or parts[-1] not in ("CE", "PE"):
@@ -251,32 +250,31 @@ def _estimate_index_option_quote(sym: str, spot_map: Optional[Dict[str, float]] 
     return {
         "ltp": ltp, "chg_pct": round(((ltp - prev_ltp) / max(prev_ltp, 1.0)) * 100.0, 2),
         "pdh": pdh, "pdl": pdl, "bar_high": bar_high, "bar_low": bar_low,
-        "rsi": rsi_u if opt == "CE" else round(100.0 - rsi_u, 2),     # exhaustion: >=78 for CE, index RSI <=22 for PE
+        "rsi": rsi_u if opt == "CE" else round(100.0 - rsi_u, 2),
         "rvol": float(idx_q.get("rvol", 1.0)), "atr": round(max(4.0, delta * float(idx_q.get("atr", spot * 0.01))), 2),
         "adx": float(idx_q.get("adx", 20.0)), "vwap": ltp,
         "spot": round(spot, 2), "iv": round(iv, 4), "t_days": round(t_years * 365.0, 3), "delta": delta,
         "feed": "index_spot_option_model_stale" if (idx_stale or vix_stale) else "index_option_bs_model",
-    }
+    }[cite: 39]
 
 
-# ---- MCX commodity proxies: international futures x USDINR ----
 COMMODITY_PROXIES: Dict[str, tuple] = {
-    "GOLDPETAL MCX": ("GC=F", "gold"),     # INR per gram, lot = 1 gram
-    "GOLDM MCX": ("GC=F", "gold10"),       # legacy label: INR per 10 grams
-    "CRUDEOILM MCX": ("CL=F", "crude"),    # INR per barrel, lot = 10 barrels
-}
+    "GOLDPETAL MCX": ("GC=F", "gold"),
+    "GOLDM MCX": ("GC=F", "gold10"),
+    "CRUDEOILM MCX": ("CL=F", "crude"),
+}[cite: 39]
 
 
 def _to_inr(kind: str, usd: Any, fx: Any) -> Any:
     if kind == "crude":
         return usd * fx
     per_gram = usd / 31.1035 * fx * GOLD_IMPORT_DUTY_FACTOR
-    return per_gram * 10.0 if kind == "gold10" else per_gram
+    return per_gram * 10.0 if kind == "gold10" else per_gram[cite: 39]
 
 
 def _naive_dates(index: Any) -> pd.DatetimeIndex:
     idx = pd.DatetimeIndex(index)
-    return (idx.tz_localize(None) if idx.tz is None else idx.tz_convert(None)).normalize()
+    return (idx.tz_localize(None) if idx.tz is None else idx.tz_convert(None)).normalize()[cite: 39]
 
 
 def _fetch_commodity_proxy_quote(sym: str) -> Optional[Dict[str, float]]:
@@ -292,8 +290,10 @@ def _fetch_commodity_proxy_quote(sym: str) -> Optional[Dict[str, float]]:
     fx_s = fx_s[~fx_s.index.duplicated(keep="last")].sort_index()
     fx_al = fx_s.reindex(_naive_dates(d.index), method="ffill").bfill().values
     conv = pd.DataFrame({
-        "Open": _to_inr(kind, d["Open"].astype(float).values, fx_al), "High": _to_inr(kind, d["High"].astype(float).values, fx_al),
-        "Low": _to_inr(kind, d["Low"].astype(float).values, fx_al), "Close": _to_inr(kind, d["Close"].astype(float).values, fx_al),
+        "Open": _to_inr(kind, d["Open"].astype(float).values, fx_al),
+        "High": _to_inr(kind, d["High"].astype(float).values, fx_al),
+        "Low": _to_inr(kind, d["Low"].astype(float).values, fx_al),
+        "Close": _to_inr(kind, d["Close"].astype(float).values, fx_al),
         "Volume": d["Volume"].astype(float).values,
     }, index=d.index)
     ind = analyze_ohlcv_indicators(conv)
@@ -306,12 +306,10 @@ def _fetch_commodity_proxy_quote(sym: str) -> Optional[Dict[str, float]]:
         prev_c = float(ind.get("prev_close", ind["ltp"]))
         ind["chg_pct"] = round(((ind["ltp"] - prev_c) / max(prev_c, 0.01)) * 100.0, 2)
     ind["feed"] = "yfinance_commodity_proxy"
-    return ind
+    return ind[cite: 39]
 
 
 def _refine_intraday_fields(q_obj: Dict[str, Any], sub_1d: pd.DataFrame, sub_1m: Optional[pd.DataFrame]) -> None:
-    """Replace the two daily-bar approximations with session-aware values:
-    VWAP = today's 1-minute session VWAP; RVOL = today's volume projected to a full day."""
     try:
         if sub_1m is None or len(sub_1m) < 5 or float(sub_1m["Volume"].astype(float).sum()) <= 0:
             return
@@ -326,11 +324,10 @@ def _refine_intraday_fields(q_obj: Dict[str, Any], sub_1d: pd.DataFrame, sub_1m:
             if avg20 > 0 and float(vol.iloc[-1]) > 0:
                 q_obj["rvol"] = round((float(vol.iloc[-1]) / frac) / avg20, 2)
     except Exception:
-        pass
+        pass[cite: 39]
 
 
 def get_swing_regime() -> Dict[str, Any]:
-    """Live Nifty regime for the Swing desk. Fails closed (UNKNOWN -> no new swing entries) without live index data."""
     qs = get_live_quotes_batch(["^NSEI", "^INDIAVIX"], force_live=True)
     n, v = qs.get("^NSEI", {}), qs.get("^INDIAVIX", {})
     if str(n.get("feed", "")) in STALE_FEEDS or float(n.get("ltp", 0) or 0) < 1000:
@@ -339,7 +336,7 @@ def get_swing_regime() -> Dict[str, Any]:
     if df is None or len(df) < 20:
         return {"mode": "UNKNOWN", "defensive": True, "reasons": ["Nifty history unavailable"], "close": float(n["ltp"]), "sma20": None, "chg_pct": float(n.get("chg_pct", 0.0)), "vix": None}
     vix = float(v["ltp"]) if (str(v.get("feed", "")) not in STALE_FEEDS and 3.0 < float(v.get("ltp", 0) or 0) < 100.0) else None
-    return classify_swing_regime(float(n["ltp"]), float(df["Close"].tail(20).mean()), float(n.get("chg_pct", 0.0)), vix)
+    return classify_swing_regime(float(n["ltp"]), float(df["Close"].tail(20).mean()), float(n.get("chg_pct", 0.0)), vix)[cite: 39]
 
 
 def _fetch_live_yfinance_quote(sym: str) -> Optional[Dict[str, float]]:
@@ -358,11 +355,10 @@ def _fetch_live_yfinance_quote(sym: str) -> Optional[Dict[str, float]]:
         ind["chg_pct"] = round(((ind["ltp"] - prev_c) / max(prev_c, 0.01)) * 100.0, 2)
         _refine_intraday_fields(ind, df_daily, df_1m)
     ind["feed"] = "yfinance_live"
-    return ind
+    return ind[cite: 39]
 
 
 def _slice_batch(batch: Any, sym: str) -> Optional[pd.DataFrame]:
-    """Extract one ticker's OHLCV from a yf.download() result (single or multi-ticker layout)."""
     try:
         if batch is None or batch.empty:
             return None
@@ -370,7 +366,7 @@ def _slice_batch(batch: Any, sym: str) -> Optional[pd.DataFrame]:
         sub = sub.dropna(subset=["Close", "High", "Low"])
         return sub if len(sub) else None
     except Exception:
-        return None
+        return None[cite: 39]
 
 
 def get_live_quotes_batch(
@@ -401,8 +397,8 @@ def get_live_quotes_batch(
                 try:
                     sub_1d = _slice_batch(batch_1d, sym)
                     if sub_1d is None or len(sub_1d) < 2:
-                        continue  # no real history -> per-symbol path below, never constants
-                    q_obj = analyze_ohlcv_indicators(sub_1d)  # real RSI/ATR/ADX/RVOL/EMA/PDH/PDL
+                        continue
+                    q_obj = analyze_ohlcv_indicators(sub_1d)
                     sub_1m = _slice_batch(batch_1m, sym)
                     if sub_1m is not None and len(sub_1m) >= 1:
                         q_obj["ltp"] = round(float(sub_1m["Close"].iloc[-1]), 2)
@@ -426,7 +422,9 @@ def get_live_quotes_batch(
         sym = str(raw_sym).strip().upper()
         if not sym or sym in result:
             continue
-        live_q = (_fetch_live_yfinance_quote(sym) or _estimate_index_option_quote(sym) or _fetch_commodity_proxy_quote(sym)) if force_live else None
+        live_q = (
+            _fetch_live_yfinance_quote(sym) or _estimate_index_option_quote(sym) or _fetch_commodity_proxy_quote(sym)
+        ) if force_live else None
         if live_q is not None:
             _QUOTE_CACHE[sym] = {"ts": now, "quote": dict(live_q)}
             result[sym] = live_q
@@ -447,12 +445,12 @@ def get_live_quotes_batch(
         }
         _QUOTE_CACHE[sym] = {"ts": now, "quote": dict(calc_q)}
         result[sym] = calc_q
-    return result
+    return result[cite: 39]
 
 
 def get_quote_snapshot(symbol: str, default_entry: float = 100.0, prefer_live: bool = True) -> Dict[str, float]:
     sym = symbol.strip().upper()
-    return get_live_quotes_batch([sym], default_entries={sym: default_entry}, force_live=prefer_live)[sym]
+    return get_live_quotes_batch([sym], default_entries={sym: default_entry}, force_live=prefer_live)[sym][cite: 39]
 
 
 def get_market_regime() -> Dict[str, Any]:
@@ -462,13 +460,19 @@ def get_market_regime() -> Dict[str, Any]:
     vix_val = float(vix_q.get("ltp", 13.40))
     vix_display = round(vix_val, 2) if vix_val < 100 else 13.40
     nifty_chg = float(nifty_q.get("chg_pct", 0.62))
-    regime = "BULLISH / LOW VIX" if (nifty_chg >= 0 and vix_display < 18.0) else ("VOLATILE / HIGH VIX" if vix_display >= 18.0 else "CAUTIOUS / RANGE")
+    regime = (
+        "BULLISH / LOW VIX"
+        if (nifty_chg >= 0 and vix_display < 18.0)
+        else ("VOLATILE / HIGH VIX" if vix_display >= 18.0 else "CAUTIOUS / RANGE")
+    )
     return {
-        "regime": regime, "vix": vix_display,
+        "regime": regime,
+        "vix": vix_display,
         "breadth_adv_pct": 68 if nifty_chg >= 0 else 42,
-        "cooldown": "OFF", "stale_feeds": 0,
+        "cooldown": "OFF",
+        "stale_feeds": 0,
         "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-    }
+    }[cite: 39]
 
 
 def get_ticker_strip() -> List[Dict[str, Any]]:
@@ -485,62 +489,7 @@ def get_ticker_strip() -> List[Dict[str, Any]]:
         {"sym": "CRUDE ₹/bbl (proxy)", "price": q["CRUDEOILM MCX"]["ltp"], "chg": q["CRUDEOILM MCX"]["chg_pct"]},
         {"sym": "RELIANCE", "price": q["RELIANCE.NS"]["ltp"], "chg": q["RELIANCE.NS"]["chg_pct"]},
         {"sym": "TATASTEEL", "price": q["TATASTEEL.NS"]["ltp"], "chg": q["TATASTEEL.NS"]["chg_pct"]},
-    ]
+    ][cite: 39]
 
 
 def get_ohlcv_bars(symbol: str, base_price: float, count: int = 32) -> List[Dict[str, Any]]:
-    raw_sym = str(symbol or "").strip().upper()
-    sym = raw_sym
-    if sym.startswith("NIFTY "):
-        sym = "^NSEI"
-    elif sym.startswith("BANKNIFTY "):
-        sym = "^NSEBANK"
-
-    if sym.endswith(".NS") or sym.startswith("^"):
-        df = _fetch_real_ohlcv_df(sym, period="3mo", interval="1d")
-        if df is not None and len(df) >= 2:
-            d = df.copy()
-            idx = pd.DatetimeIndex(d.index)
-            if idx.tz is not None:
-                idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
-            else:
-                idx = idx.tz_localize(None)
-            d.index = idx
-            d = d[~d.index.duplicated(keep="last")].sort_index()
-            # Guard against corrupt/ancient timestamps
-            d = d[d.index >= pd.Timestamp("2020-01-01")]
-            d = d.dropna(subset=["Open", "High", "Low", "Close"])
-            if len(d) >= 2:
-                tail_df = d.tail(count)
-                bars: List[Dict[str, Any]] = []
-                for ts_idx, row in tail_df.iterrows():
-                    has_time = (ts_idx.hour != 0 or ts_idx.minute != 0)
-                    dt_str = ts_idx.strftime("%Y-%m-%d %H:%M") if has_time else ts_idx.strftime("%Y-%m-%d")
-                    label = ts_idx.strftime("%b %d %H:%M") if has_time else ts_idx.strftime("%b %d, %Y")
-                    bars.append({
-                        "dt": dt_str,
-                        "bar": label,
-                        "open": round(float(row["Open"]), 2),
-                        "high": round(float(row["High"]), 2),
-                        "low": round(float(row["Low"]), 2),
-                        "close": round(float(row["Close"]), 2),
-                        "vol": round(float(row.get("Volume", 0.0) or 0.0), 1),
-                    })
-                return bars
-
-    # Fallback bars anchored to current IST date (never arbitrary B1..B32 or old dates)
-    px = round(float(base_price or 100.0), 2)
-    end_dt = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None).normalize()
-    b_dates = pd.bdate_range(end=end_dt, periods=max(2, int(count)))
-    return [
-        {
-            "dt": d.strftime("%Y-%m-%d"),
-            "bar": d.strftime("%b %d, %Y"),
-            "open": px,
-            "high": round(px * 1.004, 2),
-            "low": round(px * 0.996, 2),
-            "close": px,
-            "vol": 0.0,
-        }
-        for d in b_dates
-    ]
