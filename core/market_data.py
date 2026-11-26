@@ -488,27 +488,59 @@ def get_ticker_strip() -> List[Dict[str, Any]]:
     ]
 
 
-def get_ohlcv_bars(symbol: str, base_price: float, count: int = 32) -> List[Dict[str, float]]:
-    sym = symbol.strip().upper()
+def get_ohlcv_bars(symbol: str, base_price: float, count: int = 32) -> List[Dict[str, Any]]:
+    raw_sym = str(symbol or "").strip().upper()
+    sym = raw_sym
     if sym.startswith("NIFTY "):
         sym = "^NSEI"
     elif sym.startswith("BANKNIFTY "):
         sym = "^NSEBANK"
+
     if sym.endswith(".NS") or sym.startswith("^"):
         df = _fetch_real_ohlcv_df(sym, period="3mo", interval="1d")
-        if df is not None and len(df) >= 5:
-            tail_df = df.tail(count)
-            bars: List[Dict[str, float]] = []
-            for idx, (ts_idx, row) in enumerate(tail_df.iterrows(), start=1):
-                label = ts_idx.strftime("%m-%d") if hasattr(ts_idx, "strftime") else str(idx)
-                bars.append({
-                    "bar": label,
-                    "open": round(float(row["Open"]), 2),
-                    "high": round(float(row["High"]), 2),
-                    "low": round(float(row["Low"]), 2),
-                    "close": round(float(row["Close"]), 2),
-                    "vol": round(float(row.get("Volume", 0.0)), 1),
-                })
-            return bars
+        if df is not None and len(df) >= 2:
+            d = df.copy()
+            idx = pd.DatetimeIndex(d.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+            else:
+                idx = idx.tz_localize(None)
+            d.index = idx
+            d = d[~d.index.duplicated(keep="last")].sort_index()
+            # Guard against corrupt/ancient timestamps
+            d = d[d.index >= pd.Timestamp("2020-01-01")]
+            d = d.dropna(subset=["Open", "High", "Low", "Close"])
+            if len(d) >= 2:
+                tail_df = d.tail(count)
+                bars: List[Dict[str, Any]] = []
+                for ts_idx, row in tail_df.iterrows():
+                    has_time = (ts_idx.hour != 0 or ts_idx.minute != 0)
+                    dt_str = ts_idx.strftime("%Y-%m-%d %H:%M") if has_time else ts_idx.strftime("%Y-%m-%d")
+                    label = ts_idx.strftime("%b %d %H:%M") if has_time else ts_idx.strftime("%b %d, %Y")
+                    bars.append({
+                        "dt": dt_str,
+                        "bar": label,
+                        "open": round(float(row["Open"]), 2),
+                        "high": round(float(row["High"]), 2),
+                        "low": round(float(row["Low"]), 2),
+                        "close": round(float(row["Close"]), 2),
+                        "vol": round(float(row.get("Volume", 0.0) or 0.0), 1),
+                    })
+                return bars
+
+    # Fallback bars anchored to current IST date (never arbitrary B1..B32 or old dates)
     px = round(float(base_price or 100.0), 2)
-    return [{"bar": f"B{i+1}", "open": px, "high": round(px * 1.004, 2), "low": round(px * 0.996, 2), "close": px, "vol": 100.0} for i in range(count)]
+    end_dt = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None).normalize()
+    b_dates = pd.bdate_range(end=end_dt, periods=max(2, int(count)))
+    return [
+        {
+            "dt": d.strftime("%Y-%m-%d"),
+            "bar": d.strftime("%b %d, %Y"),
+            "open": px,
+            "high": round(px * 1.004, 2),
+            "low": round(px * 0.996, 2),
+            "close": px,
+            "vol": 0.0,
+        }
+        for d in b_dates
+    ]
