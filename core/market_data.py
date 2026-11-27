@@ -251,7 +251,7 @@ def _estimate_index_option_quote(sym: str, spot_map: Optional[Dict[str, float]] 
     return {
         "ltp": ltp, "chg_pct": round(((ltp - prev_ltp) / max(prev_ltp, 1.0)) * 100.0, 2),
         "pdh": pdh, "pdl": pdl, "bar_high": bar_high, "bar_low": bar_low,
-        "rsi": rsi_u if opt == "CE" else round(100.0 - rsi_u, 2),
+        "rsi": rsi_u if opt == "CE" else round(100.0 - rsi_u, 2),     # exhaustion: >=78 for CE, index RSI <=22 for PE
         "rvol": float(idx_q.get("rvol", 1.0)), "atr": round(max(4.0, delta * float(idx_q.get("atr", spot * 0.01))), 2),
         "adx": float(idx_q.get("adx", 20.0)), "vwap": ltp,
         "spot": round(spot, 2), "iv": round(iv, 4), "t_days": round(t_years * 365.0, 3), "delta": delta,
@@ -259,10 +259,11 @@ def _estimate_index_option_quote(sym: str, spot_map: Optional[Dict[str, float]] 
     }
 
 
+# ---- MCX commodity proxies: international futures x USDINR ----
 COMMODITY_PROXIES: Dict[str, tuple] = {
-    "GOLDPETAL MCX": ("GC=F", "gold"),
-    "GOLDM MCX": ("GC=F", "gold10"),
-    "CRUDEOILM MCX": ("CL=F", "crude"),
+    "GOLDPETAL MCX": ("GC=F", "gold"),     # INR per gram, lot = 1 gram
+    "GOLDM MCX": ("GC=F", "gold10"),       # legacy label: INR per 10 grams
+    "CRUDEOILM MCX": ("CL=F", "crude"),    # INR per barrel, lot = 10 barrels
 }
 
 
@@ -278,7 +279,8 @@ def _naive_dates(index: Any) -> pd.DatetimeIndex:
     return (idx.tz_localize(None) if idx.tz is None else idx.tz_convert(None)).normalize()
 
 
-def _fetch_commodity_proxy_quote(sym: str) -> Optional[Dict[str, float]]:
+def _commodity_proxy_daily_df(sym: str) -> Optional[Any]:
+    """Daily OHLCV of an MCX contract proxy, converted to INR (None if the international feed is unavailable)."""
     spec = COMMODITY_PROXIES.get(sym.strip().upper())
     if not spec or not _yf_allowed():
         return None
@@ -295,6 +297,17 @@ def _fetch_commodity_proxy_quote(sym: str) -> Optional[Dict[str, float]]:
         "Low": _to_inr(kind, d["Low"].astype(float).values, fx_al), "Close": _to_inr(kind, d["Close"].astype(float).values, fx_al),
         "Volume": d["Volume"].astype(float).values,
     }, index=d.index)
+    conv.attrs["fx_last"] = float(fx_al[-1])
+    return conv
+
+
+def _fetch_commodity_proxy_quote(sym: str) -> Optional[Dict[str, float]]:
+    spec = COMMODITY_PROXIES.get(sym.strip().upper())
+    conv = _commodity_proxy_daily_df(sym)
+    if not spec or conv is None:
+        return None
+    yf_t, kind = spec
+    fx_al = [conv.attrs["fx_last"]]
     ind = analyze_ohlcv_indicators(conv)
     m = _fetch_real_ohlcv_df(yf_t, period="1d", interval="1m")
     if m is not None and len(m) >= 1:
@@ -400,8 +413,8 @@ def get_live_quotes_batch(
                 try:
                     sub_1d = _slice_batch(batch_1d, sym)
                     if sub_1d is None or len(sub_1d) < 2:
-                        continue
-                    q_obj = analyze_ohlcv_indicators(sub_1d)
+                        continue  # no real history -> per-symbol path below, never constants
+                    q_obj = analyze_ohlcv_indicators(sub_1d)  # real RSI/ATR/ADX/RVOL/EMA/PDH/PDL
                     sub_1m = _slice_batch(batch_1m, sym)
                     if sub_1m is not None and len(sub_1m) >= 1:
                         q_obj["ltp"] = round(float(sub_1m["Close"].iloc[-1]), 2)
@@ -487,57 +500,119 @@ def get_ticker_strip() -> List[Dict[str, Any]]:
     ]
 
 
-def get_ohlcv_bars(symbol: str, base_price: float, count: int = 32) -> List[Dict[str, Any]]:
-    raw_sym = str(symbol or "").strip().upper()
-    sym = raw_sym
+# ---------------------------------------------------------------------------------------------- chart ranges
+# Yahoo limits: 1m history <= 7 days, 5m/15m/30m <= 60 days, 1h <= 730 days. Every combination below respects them.
+CHART_RANGES: Dict[str, Dict[str, Any]] = {
+    "1H": {"period": "1d", "intervals": ["1m", "5m"], "default": "1m", "last_minutes": 60},
+    "1D": {"period": "1d", "intervals": ["1m", "5m", "15m"], "default": "5m"},
+    "5D": {"period": "5d", "intervals": ["5m", "15m", "30m", "1h"], "default": "15m"},
+    "1M": {"period": "1mo", "intervals": ["30m", "1h", "1d"], "default": "1d"},
+    "3M": {"period": "3mo", "intervals": ["1h", "1d"], "default": "1d"},
+    "6M": {"period": "6mo", "intervals": ["1d", "1wk"], "default": "1d"},
+    "1Y": {"period": "1y", "intervals": ["1d", "1wk"], "default": "1d"},
+    "5Y": {"period": "5y", "intervals": ["1wk", "1mo"], "default": "1wk"},
+}
+_INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+
+
+def _commodity_proxy_chart_df(sym: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    """Any period/interval of an MCX proxy: international futures x USDINR (daily+ bars use the dated FX rate)."""
+    spec = COMMODITY_PROXIES.get(sym.strip().upper())
+    if not spec or not _yf_allowed():
+        return None
+    yf_t, kind = spec
+    d = _fetch_real_ohlcv_df(yf_t, period=period, interval=interval)
+    fx = _fetch_real_ohlcv_df("USDINR=X", period="5y" if period == "5y" else "1y", interval="1d")
+    if d is None or fx is None or len(d) < 2 or len(fx) < 2:
+        return None
+    fx_s = pd.Series(fx["Close"].astype(float).values, index=_naive_dates(fx.index))
+    fx_s = fx_s[~fx_s.index.duplicated(keep="last")].sort_index()
+    if interval in ("1d", "1wk", "1mo"):
+        fx_al = fx_s.reindex(_naive_dates(d.index), method="ffill").bfill().values
+    else:
+        fx_al = float(fx_s.iloc[-1])
+    return pd.DataFrame({
+        "Open": _to_inr(kind, d["Open"].astype(float).values, fx_al), "High": _to_inr(kind, d["High"].astype(float).values, fx_al),
+        "Low": _to_inr(kind, d["Low"].astype(float).values, fx_al), "Close": _to_inr(kind, d["Close"].astype(float).values, fx_al),
+        "Volume": d["Volume"].astype(float).values if "Volume" in d.columns else 0.0,
+    }, index=d.index)
+
+
+def _to_ist_naive(index: Any) -> pd.DatetimeIndex:
+    idx = pd.DatetimeIndex(index)
+    return idx.tz_localize(None) if idx.tz is None else idx.tz_convert("Asia/Kolkata").tz_localize(None)
+
+
+def get_chart_bars(symbol: str, base_price: float, range_key: str = "1M", interval: Optional[str] = None) -> Dict[str, Any]:
+    """Candles for the desk charts. range_key in CHART_RANGES ('1H','1D','5D','1M','3M','6M','1Y','5Y'); interval optional.
+    Returns {bars, source, note, interval, range}. source: live | proxy | underlying | placeholder."""
+    rk = range_key if range_key in CHART_RANGES else "1M"
+    spec = CHART_RANGES[rk]
+    iv = interval if interval in spec["intervals"] else spec["default"]
+    sym = symbol.strip().upper()
+    note, source = "", "live"
+    if sym.startswith("NIFTY ") or sym.startswith("BANKNIFTY "):
+        note = "Options have no price history: the chart shows the underlying index (the option premium itself is Black-Scholes model-priced)."
+        sym = "^NSEI" if sym.startswith("NIFTY ") else "^NSEBANK"
+        source = "underlying"
+
+    df: Optional[pd.DataFrame] = None
+    if sym in COMMODITY_PROXIES:
+        df = _commodity_proxy_chart_df(sym, spec["period"], iv)
+        if df is not None:
+            source, note = "proxy", "Commodity chart is a proxy: COMEX/NYMEX futures converted to ₹ (moves track MCX; the price level differs)."
+    elif sym.endswith(".NS") or sym.startswith("^"):
+        df = _fetch_real_ohlcv_df(sym, period=spec["period"], interval=iv)
+
+    if df is not None and len(df) >= 2:
+        intraday = iv in _INTERVAL_MINUTES
+        if rk in ("1H", "1D") and intraday:                      # keep only the latest trading session
+            last_day = _to_ist_naive(df.index)[-1].date()
+            keep = [d_.date() == last_day for d_ in _to_ist_naive(df.index)]
+            df = df[keep]
+        if "last_minutes" in spec and iv in _INTERVAL_MINUTES:
+            df = df.tail(max(2, int(spec["last_minutes"]) // _INTERVAL_MINUTES[iv]))
+        ist = _to_ist_naive(df.index)
+        fmt = "%H:%M" if rk in ("1H", "1D") else ("%d %b %H:%M" if intraday else ("%d %b %Y" if rk in ("1Y", "5Y") else "%d %b"))
+        bars = [{"bar": ist[i].strftime(fmt), "ts": ist[i].isoformat(), "open": round(float(r["Open"]), 2), "high": round(float(r["High"]), 2),
+                 "low": round(float(r["Low"]), 2), "close": round(float(r["Close"]), 2), "vol": round(float(r.get("Volume", 0.0) or 0.0), 1)}
+                for i, (_, r) in enumerate(df.iterrows())]
+        if len(bars) >= 2:
+            return {"bars": bars, "source": source, "note": note, "interval": iv, "range": rk}
+
+    px = round(float(base_price or 100.0), 2)
+    ph = [{"bar": f"B{i + 1}", "ts": "", "open": px, "high": round(px * 1.004, 2), "low": round(px * 0.996, 2), "close": px, "vol": 100.0} for i in range(32)]
+    return {"bars": ph, "source": "placeholder", "note": "No chart data available (feed blocked or market closed with no history): flat placeholder shown.", "interval": iv, "range": rk}
+
+
+def get_ohlcv_bars(symbol: str, base_price: float, count: int = 32) -> List[Dict[str, float]]:
+    sym = symbol.strip().upper()
     if sym.startswith("NIFTY "):
         sym = "^NSEI"
     elif sym.startswith("BANKNIFTY "):
         sym = "^NSEBANK"
-
-    if sym.endswith(".NS") or sym.startswith("^"):
+    if sym in COMMODITY_PROXIES:                       # real (proxy) daily candles for the commodity charts
+        df = _commodity_proxy_daily_df(sym)
+        if df is not None and len(df) >= 5:
+            df = df.rename(columns=str.title)
+    elif sym.endswith(".NS") or sym.startswith("^"):
         df = _fetch_real_ohlcv_df(sym, period="3mo", interval="1d")
-        if df is not None and len(df) >= 2:
-            d = df.copy()
-            idx = pd.DatetimeIndex(d.index)
-            if idx.tz is not None:
-                idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
-            else:
-                idx = idx.tz_localize(None)
-            d.index = idx
-            d = d[~d.index.duplicated(keep="last")].sort_index()
-            d = d[d.index >= pd.Timestamp("2020-01-01")]
-            d = d.dropna(subset=["Open", "High", "Low", "Close"])
-            if len(d) >= 2:
-                tail_df = d.tail(count)
-                bars: List[Dict[str, Any]] = []
-                for ts_idx, row in tail_df.iterrows():
-                    has_time = (ts_idx.hour != 0 or ts_idx.minute != 0)
-                    dt_str = ts_idx.strftime("%Y-%m-%d %H:%M") if has_time else ts_idx.strftime("%Y-%m-%d")
-                    label = ts_idx.strftime("%b %d %H:%M") if has_time else ts_idx.strftime("%b %d, %Y")
-                    bars.append({
-                        "dt": dt_str,
-                        "bar": label,
-                        "open": round(float(row["Open"]), 2),
-                        "high": round(float(row["High"]), 2),
-                        "low": round(float(row["Low"]), 2),
-                        "close": round(float(row["Close"]), 2),
-                        "vol": round(float(row.get("Volume", 0.0) or 0.0), 1),
-                    })
-                return bars
-
+    else:
+        df = None
+    if sym in COMMODITY_PROXIES or sym.endswith(".NS") or sym.startswith("^"):
+        if df is not None and len(df) >= 5:
+            tail_df = df.tail(count)
+            bars: List[Dict[str, float]] = []
+            for idx, (ts_idx, row) in enumerate(tail_df.iterrows(), start=1):
+                label = ts_idx.strftime("%m-%d") if hasattr(ts_idx, "strftime") else str(idx)
+                bars.append({
+                    "bar": label,
+                    "open": round(float(row["Open"]), 2),
+                    "high": round(float(row["High"]), 2),
+                    "low": round(float(row["Low"]), 2),
+                    "close": round(float(row["Close"]), 2),
+                    "vol": round(float(row.get("Volume", 0.0)), 1),
+                })
+            return bars
     px = round(float(base_price or 100.0), 2)
-    end_dt = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).replace(tzinfo=None).normalize()
-    b_dates = pd.bdate_range(end=end_dt, periods=max(2, int(count)))
-    return [
-        {
-            "dt": d.strftime("%Y-%m-%d"),
-            "bar": d.strftime("%b %d, %Y"),
-            "open": px,
-            "high": round(px * 1.004, 2),
-            "low": round(px * 0.996, 2),
-            "close": px,
-            "vol": 0.0,
-        }
-        for d in b_dates
-    ]
+    return [{"bar": f"B{i+1}", "open": px, "high": round(px * 1.004, 2), "low": round(px * 0.996, 2), "close": px, "vol": 100.0} for i in range(count)]

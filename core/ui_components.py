@@ -8,7 +8,7 @@ import streamlit as st
 from core.attribution import compute_desk_and_agent_trust
 from core.charges import compute_net_rr
 from core.config import normalize_desk_key, get_desk_config, get_effective_desk_config, parse_desk_settings
-from core.market_data import get_market_regime, get_ohlcv_bars, get_quote_snapshot, get_ticker_strip
+from core.market_data import CHART_RANGES, get_chart_bars, get_market_regime, get_quote_snapshot, get_ticker_strip
 from core.sizing import compute_position_sizing
 
 
@@ -53,7 +53,7 @@ def render_top_command_bar(ledger_source: str = "google_sheets", status_msg: str
         f"<div><span style='font-weight:700;font-size:17px;color:#FFFFFF;'>NSE Multi-Asset AI Trading Platform</span>"
         f"<span class='v48-pill pill-cyan' style='margin-left:8px;'>Schema: v4.8</span>{src_badge}</div>"
         f"<div><span class='v48-pill pill-green'>Regime: {reg['regime']} ({reg['vix']}) | Breadth: {reg['breadth_adv_pct']}% Adv</span>"
-        f"<span class='v48-pill pill-amber'>PAPER MODE — Broker Parked (live_mode=False)</span></div>"
+        f"<span class='v48-pill pill-amber'>PAPER MODE &mdash; Broker Parked (live_mode=False)</span></div>"
         f"</div></div>",
         unsafe_allow_html=True,
     )
@@ -127,7 +127,7 @@ def render_filter_watch_table(open_trades: List[Dict[str, Any]], key_prefix: str
                     f"<strong style='font-family:monospace;color:#FFFFFF;'>{sym_clean} ({t.get('desk','Swing')})</strong>"
                     f"<span class='{tier_cls}'>{tier}</span></div>"
                     f"<div style='font-size:12px;font-family:monospace;color:#CBD5E1;margin-top:6px;'>"
-                    f"Qty {int(t['qty']):,} | Entry ₹{float(t['entry']):,.2f} → LTP ₹{float(t['ltp']):,.2f}</div>"
+                    f"Qty {int(t['qty']):,} | Entry ₹{float(t['entry']):,.2f} &rarr; LTP ₹{float(t['ltp']):,.2f}</div>"
                     f"<div style='display:flex;justify-content:space-between;align-items:center;margin-top:8px;'>"
                     f"<span class='{prot_cls}'>{t['protection_label']}</span>"
                     f"<span style='font-family:monospace;font-weight:700;color:{mtm_col};'>Net {'+' if mtm >= 0 else ''}{mtm:,.2f}</span></div>"
@@ -259,7 +259,7 @@ def render_agent_war_room(messages: List[Dict[str, Any]], limit: int = 15, scope
             f"<div class='v48-kpi' style='padding:10px 14px;margin-bottom:8px;'>"
             f"<div style='display:flex;flex-wrap:wrap;justify-content:space-between;font-size:11px;font-family:monospace;'>"
             f"<div><span class='v48-pill {pill_cls}'>{sender}</span>"
-            f"<span style='color:#94A3B8;'>→ {m.get('recipient','')} | {m.get('msg_type','')}</span></div>"
+            f"<span style='color:#94A3B8;'>&rarr; {m.get('recipient','')} | {m.get('msg_type','')}</span></div>"
             f"<span style='color:#64748B;'>{m.get('cycle_id','')} | {m.get('timestamp','')}</span></div>"
             f"<div style='font-size:12.5px;color:#E2E8F0;margin-top:5px;'>{m.get('summary','')}</div>"
             f"</div>",
@@ -408,31 +408,23 @@ def render_desk_workspace(store: Any, state: Dict[str, Any], desk_key: str, defa
         f"Notional `₹{sizing['notional']:,.0f}` | Net R:R `1:{net_rr:.2f}` | Tag: **`{sizing['allocation_tag']}`**"
     )
 
-    bars = pd.DataFrame(get_ohlcv_bars(sel_chart_sym, q["ltp"], count=32))
-    x_vals = pd.to_datetime(bars["dt"], errors="coerce") if "dt" in bars.columns else bars["bar"]
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=x_vals,
-                open=bars["open"],
-                high=bars["high"],
-                low=bars["low"],
-                close=bars["close"],
-                name=sel_chart_sym,
-            )
-        ]
-    )
-    fig.add_hline(y=q["pdh"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDH ₹{q['pdh']}")
-    fig.add_hline(y=q["pdl"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDL ₹{q['pdl']}")
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0B1120",
-        plot_bgcolor="#0F172A",
-        height=350,
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(type="date", tickformat="%b %d"),
-        xaxis_rangeslider_visible=False,
-    )
+    # ---- chart: user-selected range and candle size ----
+    range_keys = list(CHART_RANGES.keys())
+    cc1, cc2 = st.columns([4, 2])
+    range_key = cc1.radio("Chart range", range_keys, index=range_keys.index("1M"), horizontal=True, key=f"{cfg.key}_chart_range")
+    iv_options = CHART_RANGES[range_key]["intervals"]
+    interval = cc2.selectbox("Candle size", iv_options, index=iv_options.index(CHART_RANGES[range_key]["default"]), key=f"{cfg.key}_chart_iv_{range_key}")
+    chart = get_chart_bars(sel_chart_sym, q["ltp"], range_key, interval)
+    bars = pd.DataFrame(chart["bars"])
+    if chart["note"]:
+        (st.warning if chart["source"] == "placeholder" else st.caption)(chart["note"])
+    fig = go.Figure(data=[go.Candlestick(x=bars["bar"], open=bars["open"], high=bars["high"], low=bars["low"], close=bars["close"], name=sel_chart_sym)])
+    if range_key in ("1H", "1D", "5D", "1M") and chart["source"] != "placeholder":
+        fig.add_hline(y=q["pdh"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDH ₹{q['pdh']}")
+        fig.add_hline(y=q["pdl"], line_dash="dash", line_color="#C084FC", annotation_text=f"PDL ₹{q['pdl']}")
+    fig.update_xaxes(type="category", nticks=10)          # category axis: no empty gaps for nights / weekends
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#0B1120", plot_bgcolor="#0F172A", height=380, margin=dict(l=10, r=10, t=30, b=10),
+                      xaxis_rangeslider_visible=False, title=dict(text=f"{sel_chart_sym} · {range_key} · {chart['interval']} candles", font=dict(size=13)))
     st.plotly_chart(fig, width="stretch")
 
     render_filter_watch_table(open_trades=desk_open, key_prefix=cfg.key, on_close_callback=lambda sym: store.close_paper_position(sym))

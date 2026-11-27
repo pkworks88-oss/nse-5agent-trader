@@ -33,3 +33,6 @@ Hard-coded stock universe (survivorship bias in backtests); NSE holiday list cov
 * **Best:** run `python run_local_loop.py` on your own PC/VPS during market hours. One process: the 20-second watchdog has its own clock; cycles run in a worker thread at :00/:05/:10… (INTRADAY, FNO, COMMODITY) and :00/:15/:30/:45 (SWING).
 * **GitHub Actions:** `.github/workflows/v48_cycles.yml` starts two long sessions per day (09:10–12:40 and 12:40–15:35 IST) running the same loop. Free *private* repos get only 2,000 Actions minutes/month (this needs ~385 min per trading day), so use a public repo or your own machine.
 * Tunables (env): `CYCLE_BUDGET_SEC` (90), `MAX_CANDIDATES_PER_CYCLE` (12), `GEMINI_TIMEOUT_MS` (8000).
+
+## Charts
+Every desk chart has a **range** selector (1H, 1D, 5D, 1M, 3M, 6M, 1Y, 5Y) and a **candle size** selector (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo - only sizes Yahoo supports for that range are offered). Options show the underlying index; commodities show the INR proxy.
