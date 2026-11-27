@@ -54,6 +54,8 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Source files are clean (no stray text / syntax errors)
+        run: python check_repo.py
       - name: Connection + data diagnostics (fails fast on a bad Google Sheet / secrets)
         run: python diagnose.py --quick
       - name: Trading session
